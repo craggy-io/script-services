@@ -60,15 +60,17 @@ Checks performed:
   all keywords: a nil `Input` with any keyword is `x takes no input`; a closed
   schema (`additionalProperties: false`) rejects unknown names
   (`x has no input "idd" (did you mean id?)`, or `(inputs: a, b)` when nothing is
-  close); every name in `Input.Required` must be passed (`x requires input "id"`).
+  close), except names matching a `patternProperties` pattern; every name in
+  `Input.Required` must be passed (`x requires input "id"`).
   A positional argument, `*args` or `**kwargs` skips the argument check for that
   call. Argument values and types are not checked.
 - **Loads:** each `load()` spec is resolved with `modules.Resolve` against the
   file name and listed once in `Analysis.Loads`. With `Env.Modules` set, the
-  target must be readable and parse, and each loaded name must be a global of the
-  target (`does not define shuot (did you mean shout?)`). Only the direct target is
-  inspected, not what it loads. Names with a leading underscore are a resolve
-  error.
+  target must be readable, parse and resolve against the names modules will see
+  at run time (`Env.ModulePredeclared`, defaulting to the program's host names
+  except `input`), and each loaded name must be a global of the target (`does not
+  define shuot (did you mean shout?)`). Only the direct target is inspected, not
+  what it loads. Names with a leading underscore are a resolve error.
 
 Suggestions use edit distance and are offered only when the nearest candidate is
 within `max(2, len/3)` edits.
@@ -77,7 +79,7 @@ within `max(2, len/3)` edits.
 
 - `Check(env Env, filename string, src []byte) []Diagnostic`
 - `Analyze(env Env, filename string, src []byte) Analysis`
-- `type Env struct { Callables []Callable; Predeclared []string; RefFuncs map[string]func(ref string) (Callable, bool); Modules modules.Source; Noun string }`
+- `type Env struct { Callables []Callable; Predeclared []string; RefFuncs map[string]func(ref string) (Callable, bool); Modules modules.Source; ModulePredeclared []string; Noun string }`
 - `type Callable struct { Name string; Input *jsonschema.Schema; Value any }`
 - `type Diagnostic struct { Pos script.Position; Severity, Message string }` (JSON `pos`, `severity`, `message`)
 - `type Analysis struct { Diagnostics []Diagnostic; Uses []Callable; Loads []string }`
@@ -86,8 +88,8 @@ within `max(2, len/3)` edits.
 
 ## Semantics, errors, and limits
 
-- Diagnostics are sorted by line and column. A syntax error stops analysis and is
-  the only diagnostic.
+- Diagnostics are sorted by file, line and column. A syntax error stops analysis
+  and is the only diagnostic.
 - `Diagnostic.Severity` is always `"error"` today: every finding means the
   script will not run as written. The field is kept so a later check can add
   warnings without changing the type; treat any other value as non-fatal (the

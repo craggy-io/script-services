@@ -47,7 +47,9 @@ else is marshalled with `encoding/json` and converted from that JSON. A `float64
 with an integral value in int64's range becomes an int.
 
 JSON → Starlark (`FromJSON`) decodes with `UseNumber`, so only numbers spelled as
-integers (`3`, not `3.0` or `1e3`) become ints. Empty input is `None`.
+integers (`3`, not `3.0` or `1e3`) become ints; integer spellings beyond int64
+stay exact ints (Starlark ints are arbitrary precision). Empty or whitespace-only
+input is `None`, and anything after the first JSON value is an error.
 
 ## Public interfaces
 
@@ -64,9 +66,12 @@ integers (`3`, not `3.0` or `1e3`) become ints. Empty input is `None`.
   dict (keywords win). A non-dict positional argument fails with
   "fn: single positional argument must be a dict, got T"; two or more positionals
   fail with "fn: pass arguments as keywords or one dict".
-- Ints beyond int64 lose precision when converted to `float64`.
-- `FromGo` turns `±Inf` floats into Starlark floats (`+inf`), which `ToJSON` cannot
-  encode back.
+- Ints beyond int64 lose precision when converted to `float64`; ints beyond
+  float64's range are errors rather than `+Inf`.
+- `FromGo` turns `±Inf` floats into Starlark floats (`+inf`); converting back is an
+  error, as NaN and ±Inf have no JSON form.
+- Cyclic values (a list or dict containing itself, a cyclic Go `map`/`slice`) and
+  values nested past `encoding/json`'s limit are errors in both directions.
 - A `float64` becomes an int only inside int64's range, `[-2^63, 2^63)`:
   `-(1<<63)` is an int, but `float64(1<<63)` (which is also what
   `float64(math.MaxInt64)` rounds to) stays a float

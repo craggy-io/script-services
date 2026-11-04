@@ -128,7 +128,7 @@ func Module(opts ...Option) starlark.Value {
 		if len(args) != 1 || len(kwargs) != 0 {
 			return nil, fmt.Errorf("schema.raw: pass one dict or JSON string")
 		}
-		s, err := c.of(args[0])
+		s, err := rawSchema(args[0])
 		if err != nil {
 			return nil, err
 		}
@@ -241,7 +241,30 @@ func copyOrder(dst, src *jsonschema.Schema) {
 	}
 }
 
+// rawSchema converts a dict or JSON string to a schema verbatim, with no
+// field-dict interpretation: schema.raw's whole contract.
+func rawSchema(v starlark.Value) (*jsonschema.Schema, error) {
+	switch t := v.(type) {
+	case starlark.String:
+		return Parse(json.RawMessage(string(t)))
+	case *starlark.Dict:
+		raw, err := values.ToJSON(t)
+		if err != nil {
+			return nil, err
+		}
+		return Parse(raw)
+	}
+	return nil, fmt.Errorf("schema.raw: pass one dict or JSON string, got %s", v.Type())
+}
+
 func (c *config) of(v starlark.Value) (*jsonschema.Schema, error) {
+	return c.ofPath(v, 0, map[*starlark.Dict]bool{})
+}
+
+func (c *config) ofPath(v starlark.Value, depth int, seen map[*starlark.Dict]bool) (*jsonschema.Schema, error) {
+	if depth > 10000 {
+		return nil, fmt.Errorf("schema is nested too deeply")
+	}
 	switch t := v.(type) {
 	case *Value:
 		return t.Schema, nil
@@ -251,6 +274,11 @@ func (c *config) of(v starlark.Value) (*jsonschema.Schema, error) {
 		}
 		return Parse(json.RawMessage(string(t)))
 	case *starlark.Dict:
+		if seen[t] {
+			return nil, fmt.Errorf("cyclic schema dict")
+		}
+		seen[t] = true
+		defer delete(seen, t)
 		if looksLikeSchema(t) {
 			raw, err := values.ToJSON(t)
 			if err != nil {
@@ -258,7 +286,7 @@ func (c *config) of(v starlark.Value) (*jsonschema.Schema, error) {
 			}
 			return Parse(raw)
 		}
-		return c.fieldsSchema(t)
+		return c.fieldsSchemaPath(t, depth, seen)
 	case starlark.NoneType:
 		return nil, nil
 	}
@@ -311,6 +339,14 @@ func looksLikeSchema(d *starlark.Dict) bool {
 // fieldsSchema builds a closed object schema from a {name: schema} dict.
 // Fields whose schema.* value says required = True are required.
 func (c *config) fieldsSchema(d *starlark.Dict) (*jsonschema.Schema, error) {
+	seen := map[*starlark.Dict]bool{}
+	if d != nil {
+		seen[d] = true
+	}
+	return c.fieldsSchemaPath(d, 0, seen)
+}
+
+func (c *config) fieldsSchemaPath(d *starlark.Dict, depth int, seen map[*starlark.Dict]bool) (*jsonschema.Schema, error) {
 	s := &jsonschema.Schema{
 		Type:       "object",
 		Properties: map[string]*jsonschema.Schema{},
@@ -326,7 +362,7 @@ func (c *config) fieldsSchema(d *starlark.Dict) (*jsonschema.Schema, error) {
 				return nil, fmt.Errorf("field name %s is not a string", pair[0])
 			}
 			name := string(ks)
-			fs, err := c.of(pair[1])
+			fs, err := c.ofPath(pair[1], depth+1, seen)
 			if err != nil {
 				return nil, fmt.Errorf("field %q: %w", name, err)
 			}

@@ -68,6 +68,7 @@ name to something else), the result is `null`.
 - `Run(ctx context.Context, lim Limits, thread *starlark.Thread, fn func() (starlark.Value, error)) (starlark.Value, error)`
 - `Call(ctx context.Context, lim Limits, name string, fn starlark.Callable, args starlark.Tuple, print func(*starlark.Thread, string)) (starlark.Value, uint64, error)`
 - `Failure(ctx context.Context, filename string, err error, timedOut bool, steps uint64) *Error`
+- `IsCancellation(err error, reason string) bool`
 
 `Filename` defaults to `"script.star"`; it names the script in positions and is
 the `from` path for relative `load()` specs. `Result` and `Error` carry JSON tags
@@ -79,11 +80,16 @@ the `from` path for relative `load()` specs. `Result` and `Error` carry JSON tag
 ### Limits and cancellation
 
 - `Limits.MaxSteps` bounds the program's own Starlark steps (module body plus
-  entry function); 0 means unbounded. Modules run on their own threads bounded by
-  `modules.Options.MaxSteps`, and their steps are not included in `Result.Steps`.
+  entry function); 0 means unbounded. A module's top level runs on its own
+  thread bounded by `modules.Options.MaxSteps`, and those steps are not included
+  in `Result.Steps`; functions defined in a module but called by the program run
+  on the program's thread, so their steps count and are bounded by
+  `Limits.MaxSteps`.
 - `Limits.Timeout` is applied as a context deadline on top of the caller's
   context, so it also cancels module loads. 0 means only the caller's context
-  bounds the run.
+  bounds the run. `TimedOut` is set only when the deadline's cancellation is
+  what stopped the script: a host built-in that returns its own error after the
+  deadline reports that error (still reachable via `Unwrap`), not a timeout.
 - The zero `Options` has no limits at all; pass `DefaultLimits` or your own.
 - Cancellation stops Starlark between steps. Time spent waiting inside a host
   built-in uses no steps and is not interrupted; `Exec` does not pass the context
@@ -120,7 +126,10 @@ Every failure from `Exec` is a `*script.Error`:
 - `Failure` is the classifier `Exec` uses: positions from `EvalError`,
   `syntax.Error` or `resolve.ErrorList`; `Cancelled` if `ctx` has ended; otherwise
   `Invalid`, with `TimedOut` and `TimeLimitMessage` when `timedOut` is set. An
-  existing `*script.Error` is returned unchanged.
+  error that is itself a `*script.Error` is returned unchanged; a wrapped one is
+  reclassified, with the original reachable via `Unwrap`. Hosts computing
+  `timedOut` for `Failure` can use `IsCancellation(err, reason)`, which reports
+  whether err is Starlark's cancellation error for a `thread.Cancel` reason.
 
 ### Print
 

@@ -32,6 +32,7 @@ package startest
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"sort"
@@ -142,7 +143,10 @@ func Run(t *testing.T, fsys fs.FS, opts Options) {
 // RunFile runs the tests in the test file at path in src. A file whose top
 // level fails yields one outcome with an empty Test. Otherwise there is one
 // outcome per test_* function, preceded by a passing file-level outcome
-// (empty Test) carrying the top level's print() output when it printed.
+// (empty Test) carrying the top level's print() output when it printed. A
+// file defining no test_* functions yields one failing file-level outcome:
+// a test file with no tests is a failure, not a pass, so renamed or
+// mistyped test names cannot silently green a run.
 //
 // opts.Limits.Timeout bounds the top level including the modules it loads;
 // running out is an Invalid error with TimedOut set, as in script.Exec.
@@ -196,10 +200,17 @@ func RunFile(ctx context.Context, src modules.Source, p string, opts Options) []
 		globals.Freeze()
 		return starlark.None, err
 	})
+	convertedCancel := false
 	if err == nil && runCtx.Err() != nil {
 		err = runCtx.Err()
+		convertedCancel = true
 	}
-	timedOut := lim.Timeout > 0 && ctx.Err() == nil && runCtx.Err() != nil
+	// As in script.Exec: only the deadline's own cancellation (or a
+	// success converted after it) is a timeout; a genuine error that
+	// returned after the deadline keeps its own message.
+	timedOut := lim.Timeout > 0 && ctx.Err() == nil &&
+		errors.Is(runCtx.Err(), context.DeadlineExceeded) &&
+		(convertedCancel || script.IsCancellation(err, "context done: "+context.DeadlineExceeded.Error()))
 	cancel()
 	steps := thread.ExecutionSteps()
 	if err != nil {
@@ -210,19 +221,35 @@ func RunFile(ctx context.Context, src modules.Source, p string, opts Options) []
 		out = append(out, Outcome{File: p, Steps: steps, Output: top})
 	}
 	var names []string
-	for name, v := range globals {
-		if _, ok := v.(*starlark.Function); ok && strings.HasPrefix(name, "test_") {
+	for name := range globals {
+		if strings.HasPrefix(name, "test_") {
 			names = append(names, name)
 		}
 	}
 	sort.Strings(names)
+	if len(names) == 0 {
+		msg := fmt.Errorf("no test_* functions in %s", p)
+		out = append(out, Outcome{File: p, Err: script.Failure(ctx, p, msg, false, steps), Steps: steps, Output: flush()})
+		return out
+	}
 	for _, name := range names {
-		fn := globals[name].(*starlark.Function)
 		o := Outcome{File: p, Test: name}
-		if fn.NumParams() > 0 {
-			msg := fmt.Errorf("%s: test functions take no parameters", name)
+		var fn starlark.Callable
+		switch v := globals[name].(type) {
+		case *starlark.Function:
+			if v.NumParams() > 0 {
+				msg := fmt.Errorf("%s: test functions take no parameters", name)
+				o.Err = script.Failure(ctx, p, msg, false, 0)
+				o.Err.Pos = script.PositionOf(v.Position())
+				out = append(out, o)
+				continue
+			}
+			fn = v
+		case starlark.Callable:
+			fn = v // a host built-in bound to a test_* name still runs
+		default:
+			msg := fmt.Errorf("%s: test_* names must be functions, got %s", name, globals[name].Type())
 			o.Err = script.Failure(ctx, p, msg, false, 0)
-			o.Err.Pos = script.PositionOf(fn.Position())
 			out = append(out, o)
 			continue
 		}
@@ -240,8 +267,8 @@ func RunFile(ctx context.Context, src modules.Source, p string, opts Options) []
 // Assert returns the assert module test files see.
 func Assert() starlark.Value {
 	return &starlarkstruct.Module{Name: "assert", Members: starlark.StringDict{
-		"eq":       starlark.NewBuiltin("assert.eq", assertCompare(syntax.EQL, "%s != %s")),
-		"ne":       starlark.NewBuiltin("assert.ne", assertCompare(syntax.NEQ, "%s == %s")),
+		"eq":       starlark.NewBuiltin("assert.eq", assertCompare(syntax.EQL, "want", "%s != %s")),
+		"ne":       starlark.NewBuiltin("assert.ne", assertCompare(syntax.NEQ, "other", "%s == %s")),
 		"true":     starlark.NewBuiltin("assert.true", assertTruth(true)),
 		"false":    starlark.NewBuiltin("assert.false", assertTruth(false)),
 		"contains": starlark.NewBuiltin("assert.contains", assertContains),
@@ -257,11 +284,11 @@ func failf(msg, format string, args ...any) error {
 	return fmt.Errorf("assertion failed: %s", s)
 }
 
-func assertCompare(op syntax.Token, format string) func(*starlark.Thread, *starlark.Builtin, starlark.Tuple, []starlark.Tuple) (starlark.Value, error) {
+func assertCompare(op syntax.Token, second, format string) func(*starlark.Thread, *starlark.Builtin, starlark.Tuple, []starlark.Tuple) (starlark.Value, error) {
 	return func(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 		var x, y starlark.Value
 		var msg string
-		if err := starlark.UnpackArgs(b.Name(), args, kwargs, "x", &x, "y", &y, "msg?", &msg); err != nil {
+		if err := starlark.UnpackArgs(b.Name(), args, kwargs, "got", &x, second, &y, "msg?", &msg); err != nil {
 			return nil, err
 		}
 		ok, err := starlark.Compare(op, x, y)
@@ -279,7 +306,7 @@ func assertTruth(want bool) func(*starlark.Thread, *starlark.Builtin, starlark.T
 	return func(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 		var x starlark.Value
 		var msg string
-		if err := starlark.UnpackArgs(b.Name(), args, kwargs, "x", &x, "msg?", &msg); err != nil {
+		if err := starlark.UnpackArgs(b.Name(), args, kwargs, "cond", &x, "msg?", &msg); err != nil {
 			return nil, err
 		}
 		if bool(x.Truth()) != want {

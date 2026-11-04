@@ -26,6 +26,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -69,6 +70,15 @@ type Env struct {
 	RefFuncs map[string]func(ref string) (Callable, bool)
 	// Modules, when set, is where load() targets are looked up.
 	Modules modules.Source
+	// ModulePredeclared are the names load()ed modules will see besides
+	// the Starlark universe: the keys of the Predeclared the host passes
+	// to modules.NewLoader. Module files are resolved against exactly
+	// these names, so a module using `input` or another program-only name
+	// is a diagnostic. Nil means the program's own predeclared roots
+	// (callable and ref-function roots plus Predeclared, except "input"),
+	// which matches hosts that give modules the same built-ins as
+	// programs; pass an empty non-nil slice when modules get none.
+	ModulePredeclared []string
 	// Noun names a callable in messages ("unknown <Noun> x.y", "x is a
 	// namespace, not a <Noun>"). Empty means "callable"; a capability
 	// registry passes "capability".
@@ -131,6 +141,21 @@ func Analyze(env Env, filename string, src []byte) Analysis {
 	for _, k := range env.Predeclared {
 		predeclared[k] = true
 	}
+	if env.ModulePredeclared != nil {
+		c.moduleNames = map[string]bool{}
+		for _, k := range env.ModulePredeclared {
+			c.moduleNames[k] = true
+		}
+	} else {
+		// Default: modules see the program's host names except input,
+		// matching a Loader given the same built-ins as the program.
+		c.moduleNames = map[string]bool{}
+		for k := range predeclared {
+			if k != "input" {
+				c.moduleNames[k] = true
+			}
+		}
+	}
 	f, err := dialect.Parse(filename, src)
 	if err != nil {
 		if se, ok := err.(syntax.Error); ok {
@@ -155,6 +180,9 @@ func Analyze(env Env, filename string, src []byte) Analysis {
 	syntax.Walk(f, c.visit)
 	sort.SliceStable(c.diags, func(i, j int) bool {
 		a, b := c.diags[i].Pos, c.diags[j].Pos
+		if a.File != b.File {
+			return a.File < b.File
+		}
 		if a.Line != b.Line {
 			return a.Line < b.Line
 		}
@@ -164,14 +192,15 @@ func Analyze(env Env, filename string, src []byte) Analysis {
 }
 
 type checker struct {
-	tree     map[string]any // inner nodes map[string]any; leaves Callable or *refFunc
-	filename string
-	noun     string // what callables are called in messages
-	names    []string
-	diags    []Diagnostic
-	uses     []Callable
-	used     map[string]bool
-	loads    []string
+	tree        map[string]any // inner nodes map[string]any; leaves Callable or *refFunc
+	filename    string
+	noun        string // what callables are called in messages
+	names       []string
+	moduleNames map[string]bool // names load()ed modules may use
+	diags       []Diagnostic
+	uses        []Callable
+	used        map[string]bool
+	loads       []string
 }
 
 // insert places a leaf at a dotted path. Ref functions take precedence over
@@ -249,9 +278,20 @@ func (c *checker) checkLoad(src modules.Source, ld *syntax.LoadStmt) {
 		c.add(ld.Module.TokenPos, "error", fmt.Sprintf("load %q: %s does not parse: %s", spec, p, msg))
 		return
 	}
-	// Resolve with everything predeclared: only the module's own globals
-	// matter here, not what its host provides.
-	_ = dialect.Resolve(mf, func(string) bool { return true })
+	// Resolve the module against exactly the names it will see at
+	// runtime (Env.ModulePredeclared) and surface every failure: a
+	// module that does not resolve will not load, so it must not check
+	// clean. Globals are still collected below for the loaded-name
+	// check.
+	if err := dialect.Resolve(mf, func(n string) bool { return c.moduleNames[n] }); err != nil {
+		if list, ok := err.(resolve.ErrorList); ok {
+			for _, e := range list {
+				c.add(ld.Module.TokenPos, "error", fmt.Sprintf("load %q: %s:%d:%d: %s", spec, p, e.Pos.Line, e.Pos.Col, e.Msg))
+			}
+		} else {
+			c.add(ld.Module.TokenPos, "error", fmt.Sprintf("load %q: %s: %v", spec, p, err))
+		}
+	}
 	defined := map[string]bool{}
 	var names []string
 	if m, ok := mf.Module.(*resolve.Module); ok {
@@ -442,7 +482,19 @@ func (c *checker) checkArgs(pos syntax.Position, cl Callable, args []syntax.Expr
 		sort.Strings(known)
 		var unknown []string
 		for k := range kw {
-			if _, ok := in.Properties[k]; !ok {
+			if _, ok := in.Properties[k]; ok {
+				continue
+			}
+			// A name matching a patternProperties pattern is a known
+			// input even in a closed schema.
+			matched := false
+			for pat := range in.PatternProperties {
+				if ok, _ := regexp.MatchString(pat, k); ok {
+					matched = true
+					break
+				}
+			}
+			if !matched {
 				unknown = append(unknown, k)
 			}
 		}

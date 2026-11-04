@@ -5,8 +5,8 @@ import (
 	"fmt"
 
 	"go.starlark.net/starlark"
-	"go.starlark.net/syntax"
 
+	"github.com/craggy-io/script-services/dialect"
 	"github.com/craggy-io/script-services/values"
 )
 
@@ -54,7 +54,7 @@ func ExampleKwargsToJSON() {
 	})
 	thread := &starlark.Thread{}
 	for _, src := range []string{`get(id = "a", depth = 2)`, `get({"id": "a"}, depth = 3)`, `get(1, 2)`} {
-		v, err := starlark.EvalOptions(&syntax.FileOptions{}, thread, "x.star", src, starlark.StringDict{"get": get})
+		v, err := starlark.EvalOptions(dialect.FileOptions, thread, "x.star", src, starlark.StringDict{"get": get})
 		if err != nil {
 			fmt.Println(err)
 			continue

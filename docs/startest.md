@@ -25,7 +25,10 @@ A test file is a script whose top level is setup. Its top level runs once; then
 each `test_*` function runs, in name order, on a fresh thread with the configured
 limits. A test passes when it returns without error. If the top level fails, the
 file yields a single failing outcome and no tests run. If it passes but prints,
-a passing file-level outcome carrying that output comes before the tests.
+a passing file-level outcome carrying that output comes before the tests. A file
+defining no `test_*` functions yields a single failing file-level outcome, so a
+renamed or mistyped test cannot silently pass; a `test_*` name bound to a
+non-function likewise fails, while one bound to a host built-in runs as a test.
 
 ## Responsibilities and boundaries
 
