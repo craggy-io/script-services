@@ -49,6 +49,7 @@
 package types
 
 import (
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -132,6 +133,9 @@ func Parse(filename string, src []byte) (*Package, error) {
 				dd.desc, dd.enum = splitDoc(doc.Text())
 				dd.pos = doc.Pos()
 			}
+			if _, dup := p.decls[ts.Name.Name]; dup {
+				return nil, p.errorf(ts.Name.Pos(), "type %s is declared twice", ts.Name.Name)
+			}
 			p.decls[ts.Name.Name] = dd
 		}
 	}
@@ -146,7 +150,7 @@ func splitDoc(text string) (string, []string) {
 	var enum []string
 	for _, line := range strings.Split(text, "\n") {
 		if m := enumLine.FindStringSubmatch(line); m != nil {
-			for _, v := range strings.Split(m[1], ",") {
+			for _, v := range splitEnum(m[1]) {
 				if v = strings.TrimSpace(v); v != "" {
 					enum = append(enum, v)
 				}
@@ -156,6 +160,34 @@ func splitDoc(text string) (string, []string) {
 		keep = append(keep, line)
 	}
 	return strings.TrimSpace(strings.Join(keep, "\n")), enum
+}
+
+// splitEnum splits an enum list on commas, ignoring commas inside quoted
+// ("..." or `...`) values.
+func splitEnum(s string) []string {
+	var out []string
+	var cur strings.Builder
+	var quote byte // 0, '"' or '`'
+	escaped := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case escaped:
+			escaped = false
+		case quote == '"' && c == '\\':
+			escaped = true
+		case quote != 0 && c == quote:
+			quote = 0
+		case quote == 0 && (c == '"' || c == '`'):
+			quote = c
+		case quote == 0 && c == ',':
+			out = append(out, cur.String())
+			cur.Reset()
+			continue
+		}
+		cur.WriteByte(c)
+	}
+	return append(out, cur.String())
 }
 
 // Names returns the declared type names, sorted.
@@ -215,32 +247,35 @@ func (b *builder) named(d *decl, at token.Pos) (*jsonschema.Schema, error) {
 		s.Description = d.desc
 	}
 	if len(d.enum) > 0 {
-		if s.Enum, err = enumValues(s.Type, d.enum); err != nil {
+		if s.Enum, err = enumValues(s, d.enum); err != nil {
 			return nil, b.p.errorf(d.pos, "type %s: %v", name, err)
 		}
 	}
 	return s, nil
 }
 
-func enumValues(typ string, vals []string) ([]any, error) {
+func enumValues(s *jsonschema.Schema, vals []string) ([]any, error) {
 	out := make([]any, 0, len(vals))
 	for _, v := range vals {
-		switch typ {
+		switch s.Type {
 		case "string":
 			if uq, err := strconv.Unquote(v); err == nil {
 				v = uq
 			}
 			out = append(out, v)
 		case "integer":
-			n, err := strconv.ParseInt(v, 10, 64) // decimal: "010" is ten
+			n, err := enumInt(s, v)
 			if err != nil {
-				return nil, fmt.Errorf("enum value %q is not an integer", v)
+				return nil, err
 			}
 			out = append(out, n)
 		case "number":
 			f, err := strconv.ParseFloat(v, 64)
 			if err != nil {
 				return nil, fmt.Errorf("enum value %q is not a number", v)
+			}
+			if math.IsNaN(f) || math.IsInf(f, 0) {
+				return nil, fmt.Errorf("enum value %q is not a finite number", v)
 			}
 			out = append(out, f)
 		case "boolean":
@@ -254,6 +289,43 @@ func enumValues(typ string, vals []string) ([]any, error) {
 		}
 	}
 	return out, nil
+}
+
+// enumInt parses one integer enum value against the kind's range as the
+// schema records it (Minimum/Maximum): unsigned kinds (Minimum 0) parse as
+// uint64, so their full range is accepted, and bounded kinds reject values
+// they cannot hold.
+func enumInt(s *jsonschema.Schema, v string) (any, error) {
+	notInt := fmt.Errorf("enum value %q is not an integer", v)
+	outOfRange := fmt.Errorf("enum value %q is out of range for the type", v)
+	isRangeErr := func(err error) bool {
+		var ne *strconv.NumError
+		return errors.As(err, &ne) && ne.Err == strconv.ErrRange
+	}
+	if s.Minimum != nil && *s.Minimum == 0 { // unsigned kind
+		n, err := strconv.ParseUint(v, 10, 64) // decimal: "010" is ten
+		if err != nil {
+			if isRangeErr(err) || strings.HasPrefix(v, "-") {
+				return nil, outOfRange
+			}
+			return nil, notInt
+		}
+		if s.Maximum != nil && n > uint64(*s.Maximum) {
+			return nil, outOfRange
+		}
+		return n, nil
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		if isRangeErr(err) {
+			return nil, outOfRange
+		}
+		return nil, notInt
+	}
+	if (s.Minimum != nil && n < int64(*s.Minimum)) || (s.Maximum != nil && n > int64(*s.Maximum)) {
+		return nil, outOfRange
+	}
+	return n, nil
 }
 
 func f64(f float64) *float64 { return &f }
@@ -502,8 +574,10 @@ func (b *builder) fields(st *ast.StructType, depth int) ([]prop, error) {
 		if omit {
 			continue
 		}
-		if len(f.Names) == 0 && jsonName == "" {
-			// Embedded field: promote the embedded struct's fields.
+		if len(f.Names) == 0 && jsonName == "" && b.embedsStruct(f.Type) {
+			// Embedded struct: promote its fields. A non-struct embed
+			// (or one with a json name) is a regular field instead, as
+			// in encoding/json.
 			inner, err := b.embedded(f.Type, depth)
 			if err != nil {
 				return nil, err
@@ -512,11 +586,15 @@ func (b *builder) fields(st *ast.StructType, depth int) ([]prop, error) {
 			continue
 		}
 		names := f.Names
-		if len(names) == 0 {
+		isEmbed := len(names) == 0
+		if isEmbed {
 			names = []*ast.Ident{{Name: embeddedName(f.Type), NamePos: f.Type.Pos()}}
 		}
 		for _, id := range names {
-			if !ast.IsExported(id.Name) {
+			// An embedded field of unexported type with an explicit
+			// json name is visible under that name (encoding/json
+			// emits it); other unexported fields are not.
+			if !ast.IsExported(id.Name) && !(isEmbed && jsonName != "") {
 				continue
 			}
 			fs, err := b.expr(f.Type)
@@ -572,29 +650,53 @@ func embeddedName(e ast.Expr) string {
 	return "?"
 }
 
-func (b *builder) embedded(e ast.Expr, depth int) ([]prop, error) {
+// embedsStruct reports whether e, an embedded field's type, resolves
+// through declared names and aliases (type Alias = Base) to a struct
+// declared in this file.
+func (b *builder) embedsStruct(e ast.Expr) bool {
+	_, _, ok := b.structDecl(e)
+	return ok
+}
+
+// structDecl resolves e through pointers and declared names/aliases to a
+// struct type, returning it and the declaring name.
+func (b *builder) structDecl(e ast.Expr) (*ast.StructType, string, bool) {
 	if star, ok := e.(*ast.StarExpr); ok {
 		e = star.X
 	}
-	id, ok := e.(*ast.Ident)
+	seen := map[string]bool{}
+	for {
+		id, ok := e.(*ast.Ident)
+		if !ok || seen[id.Name] {
+			return nil, "", false
+		}
+		seen[id.Name] = true
+		d, ok := b.p.decls[id.Name]
+		if !ok {
+			return nil, "", false
+		}
+		if st, ok := d.spec.Type.(*ast.StructType); ok {
+			return st, id.Name, true
+		}
+		e = d.spec.Type
+		if star, ok := e.(*ast.StarExpr); ok {
+			e = star.X
+		}
+	}
+}
+
+func (b *builder) embedded(e ast.Expr, depth int) ([]prop, error) {
+	st, name, ok := b.structDecl(e)
 	if !ok {
 		return nil, b.p.errorf(e.Pos(), "unsupported embedded type %s: embed a struct declared in this file", gotypes.ExprString(e))
 	}
-	d, ok := b.p.decls[id.Name]
-	if !ok {
-		return nil, b.p.errorf(id.Pos(), "unknown embedded type %s", id.Name)
-	}
-	st, ok := d.spec.Type.(*ast.StructType)
-	if !ok {
-		return nil, b.p.errorf(id.Pos(), "embedded type %s is not a struct; give the field a json name", id.Name)
-	}
 	for _, n := range b.stack {
-		if n == id.Name {
-			chain := append(append([]string(nil), b.stack...), id.Name)
-			return nil, b.p.errorf(id.Pos(), "recursive type %s (%s)", id.Name, strings.Join(chain, " -> "))
+		if n == name {
+			chain := append(append([]string(nil), b.stack...), name)
+			return nil, b.p.errorf(e.Pos(), "recursive type %s (%s)", name, strings.Join(chain, " -> "))
 		}
 	}
-	b.stack = append(b.stack, id.Name)
+	b.stack = append(b.stack, name)
 	defer func() { b.stack = b.stack[:len(b.stack)-1] }()
 	return b.fields(st, depth+1)
 }

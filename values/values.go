@@ -13,22 +13,38 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
+	"math/big"
+	"reflect"
 	"sort"
+	"strings"
 
 	"go.starlark.net/starlark"
 )
 
-// FromJSON converts JSON to a Starlark value. Empty input is None.
-// Integral numbers become ints, others floats.
+// maxDepth bounds nesting in conversions, matching encoding/json's own
+// nesting limit. Cyclic values are reported separately, well before this.
+const maxDepth = 10000
+
+// FromJSON converts JSON to a Starlark value. Empty (or whitespace-only)
+// input is None. Integral numbers become ints, others floats. Anything
+// after the first JSON value is an error.
 func FromJSON(raw json.RawMessage) (starlark.Value, error) {
-	if len(raw) == 0 {
+	if len(bytes.TrimSpace(raw)) == 0 {
 		return starlark.None, nil
 	}
 	var v any
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()
 	if err := dec.Decode(&v); err != nil {
+		return nil, err
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return nil, fmt.Errorf("trailing data after JSON value")
+		}
 		return nil, err
 	}
 	return FromGo(v)
@@ -39,6 +55,21 @@ func FromJSON(raw json.RawMessage) (starlark.Value, error) {
 // directly; anything else goes through encoding/json first. An integral
 // float64 in int64's range [-2^63, 2^63) becomes an int; others stay floats.
 func FromGo(v any) (starlark.Value, error) {
+	return fromGo(v, 0, map[goContainer]bool{})
+}
+
+// goContainer identifies a []any or map[string]any on the current
+// conversion path, for cycle detection. Shared (acyclic) substructure off
+// the path converts normally.
+type goContainer struct {
+	ptr   uintptr
+	isMap bool
+}
+
+func fromGo(v any, depth int, seen map[goContainer]bool) (starlark.Value, error) {
+	if depth > maxDepth {
+		return nil, fmt.Errorf("value is nested too deeply")
+	}
 	switch t := v.(type) {
 	case nil:
 		return starlark.None, nil
@@ -49,6 +80,13 @@ func FromGo(v any) (starlark.Value, error) {
 	case json.Number:
 		if i, err := t.Int64(); err == nil {
 			return starlark.MakeInt64(i), nil
+		}
+		// An integer-spelled number beyond int64 stays an exact int:
+		// Starlark ints are arbitrary precision.
+		if !strings.ContainsAny(t.String(), ".eE") {
+			if bi, ok := new(big.Int).SetString(t.String(), 10); ok {
+				return starlark.MakeBigInt(bi), nil
+			}
 		}
 		f, err := t.Float64()
 		if err != nil {
@@ -63,9 +101,17 @@ func FromGo(v any) (starlark.Value, error) {
 		}
 		return starlark.Float(t), nil
 	case []any:
+		if len(t) > 0 {
+			key := goContainer{ptr: reflect.ValueOf(t).Pointer()}
+			if seen[key] {
+				return nil, fmt.Errorf("cyclic value is not JSON-convertible")
+			}
+			seen[key] = true
+			defer delete(seen, key)
+		}
 		elems := make([]starlark.Value, 0, len(t))
 		for _, e := range t {
-			sv, err := FromGo(e)
+			sv, err := fromGo(e, depth+1, seen)
 			if err != nil {
 				return nil, err
 			}
@@ -73,6 +119,14 @@ func FromGo(v any) (starlark.Value, error) {
 		}
 		return starlark.NewList(elems), nil
 	case map[string]any:
+		if len(t) > 0 {
+			key := goContainer{ptr: reflect.ValueOf(t).Pointer(), isMap: true}
+			if seen[key] {
+				return nil, fmt.Errorf("cyclic value is not JSON-convertible")
+			}
+			seen[key] = true
+			defer delete(seen, key)
+		}
 		d := starlark.NewDict(len(t))
 		keys := make([]string, 0, len(t))
 		for k := range t {
@@ -80,7 +134,7 @@ func FromGo(v any) (starlark.Value, error) {
 		}
 		sort.Strings(keys)
 		for _, k := range keys {
-			sv, err := FromGo(t[k])
+			sv, err := fromGo(t[k], depth+1, seen)
 			if err != nil {
 				return nil, err
 			}
@@ -100,8 +154,18 @@ func FromGo(v any) (starlark.Value, error) {
 
 // ToGo converts a Starlark value to a JSON-marshalable Go value: nil, bool,
 // string, int64, float64, []any or map[string]any. Ints too large for int64
-// become float64. Tuples and sets become slices.
+// become float64. Tuples and sets become slices. Cyclic values, values
+// nested beyond encoding/json's limit, and non-finite floats (NaN, ±Inf,
+// including ints too large for float64) are errors: none of them can become
+// JSON.
 func ToGo(v starlark.Value) (any, error) {
+	return toGo(v, 0, map[starlark.Value]bool{})
+}
+
+func toGo(v starlark.Value, depth int, seen map[starlark.Value]bool) (any, error) {
+	if depth > maxDepth {
+		return nil, fmt.Errorf("value is nested too deeply")
+	}
 	switch t := v.(type) {
 	case starlark.NoneType:
 		return nil, nil
@@ -114,15 +178,27 @@ func ToGo(v starlark.Value) (any, error) {
 			return i, nil
 		}
 		f, _ := starlark.AsFloat(v)
+		if math.IsInf(f, 0) {
+			return nil, fmt.Errorf("int %s is too large to convert to JSON", t)
+		}
 		return f, nil
 	case starlark.Float:
-		return float64(t), nil
+		f := float64(t)
+		if math.IsNaN(f) || math.IsInf(f, 0) {
+			return nil, fmt.Errorf("float %v is not JSON-convertible", f)
+		}
+		return f, nil
 	case *starlark.List:
-		return iterToGo(t, t.Len())
+		if seen[v] {
+			return nil, fmt.Errorf("cyclic value is not JSON-convertible")
+		}
+		seen[v] = true
+		defer delete(seen, v)
+		return iterToGo(t, t.Len(), depth, seen)
 	case starlark.Tuple:
 		out := make([]any, 0, len(t))
 		for _, e := range t {
-			gv, err := ToGo(e)
+			gv, err := toGo(e, depth+1, seen)
 			if err != nil {
 				return nil, err
 			}
@@ -130,13 +206,18 @@ func ToGo(v starlark.Value) (any, error) {
 		}
 		return out, nil
 	case *starlark.Dict:
+		if seen[v] {
+			return nil, fmt.Errorf("cyclic value is not JSON-convertible")
+		}
+		seen[v] = true
+		defer delete(seen, v)
 		out := make(map[string]any, t.Len())
 		for _, pair := range t.Items() {
 			ks, ok := pair[0].(starlark.String)
 			if !ok {
 				return nil, fmt.Errorf("dict key %s is not a string", pair[0])
 			}
-			gv, err := ToGo(pair[1])
+			gv, err := toGo(pair[1], depth+1, seen)
 			if err != nil {
 				return nil, err
 			}
@@ -144,18 +225,23 @@ func ToGo(v starlark.Value) (any, error) {
 		}
 		return out, nil
 	case *starlark.Set:
-		return iterToGo(t, t.Len())
+		if seen[v] {
+			return nil, fmt.Errorf("cyclic value is not JSON-convertible")
+		}
+		seen[v] = true
+		defer delete(seen, v)
+		return iterToGo(t, t.Len(), depth, seen)
 	}
 	return nil, fmt.Errorf("value of type %s is not JSON-convertible", v.Type())
 }
 
-func iterToGo(it starlark.Iterable, n int) (any, error) {
+func iterToGo(it starlark.Iterable, n, depth int, seen map[starlark.Value]bool) (any, error) {
 	out := make([]any, 0, n)
 	iter := it.Iterate()
 	defer iter.Done()
 	var e starlark.Value
 	for iter.Next(&e) {
-		gv, err := ToGo(e)
+		gv, err := toGo(e, depth+1, seen)
 		if err != nil {
 			return nil, err
 		}

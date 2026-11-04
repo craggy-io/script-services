@@ -106,9 +106,18 @@ func cmdCheck(args []string, stdout, stderr io.Writer) (int, error) {
 	}
 	code := 0
 	for _, file := range fs.Args() {
+		// A file that cannot be read or placed under its root is
+		// reported and the rest are still checked.
+		fileErr := func(c int, err error) {
+			fmt.Fprintf(stderr, "%s: %v\n", file, err)
+			if code == 0 {
+				code = c
+			}
+		}
 		src, err := os.ReadFile(file)
 		if err != nil {
-			return 1, err
+			fileErr(1, err)
+			continue
 		}
 		dir := *root
 		if dir == "" {
@@ -116,11 +125,13 @@ func cmdCheck(args []string, stdout, stderr io.Writer) (int, error) {
 		}
 		name, err := relTo(dir, file)
 		if err != nil {
-			return 2, err
+			fileErr(2, err)
+			continue
 		}
 		mods, err := modules.DirRoot(dir)
 		if err != nil {
-			return 1, err
+			fileErr(1, err)
+			continue
 		}
 		diags := check.Check(check.Env{Modules: mods}, name, src)
 		mods.Close()
@@ -173,7 +184,10 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr io.Writer) (int, 
 	if *root == "" {
 		*root = filepath.Dir(file)
 	}
-	var in any
+	// Keep the input as raw JSON: decoding into any would turn integers
+	// beyond float64's exact range (2^53) into different numbers before
+	// the script ever sees them.
+	var in json.RawMessage
 	if err := json.Unmarshal([]byte(*input), &in); err != nil {
 		return 2, fmt.Errorf("-input: %w", err)
 	}
@@ -248,6 +262,10 @@ func cmdTest(ctx context.Context, args []string, stdout, stderr io.Writer) (int,
 			}
 			failed++
 			fmt.Fprintf(stdout, "FAIL %s\n    %s\n", o.Name(), o.Err.Error())
+			for i := len(o.Err.Backtrace) - 1; i >= 0; i-- {
+				fr := o.Err.Backtrace[i]
+				fmt.Fprintf(stdout, "      at %s (%s:%d:%d)\n", fr.Func, fr.Pos.File, fr.Pos.Line, fr.Pos.Col)
+			}
 		}
 	}
 	fmt.Fprintf(stdout, "%d passed, %d failed\n", passed, failed)

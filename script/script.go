@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"go.starlark.net/resolve"
@@ -164,19 +165,72 @@ func NewThread(name string, lim Limits, print func(*starlark.Thread, string)) *s
 // Run calls fn, cancelling thread when ctx ends or lim.Timeout elapses. A
 // timeout cancels the thread with the reason "time limit exceeded".
 func Run(ctx context.Context, lim Limits, thread *starlark.Thread, fn func() (starlark.Value, error)) (starlark.Value, error) {
+	v, err, _ := runTracked(ctx, lim, thread, fn)
+	return v, err
+}
+
+// cancelKind records which of Run's cancellation sources fired first, so
+// callers can tell a timeout apart from caller cancellation (and from a
+// genuine error that merely returned late) without sniffing error text.
+type cancelKind int32
+
+const (
+	cancelNone cancelKind = iota
+	cancelContext
+	cancelTimeout
+)
+
+func runTracked(ctx context.Context, lim Limits, thread *starlark.Thread, fn func() (starlark.Value, error)) (starlark.Value, error, cancelKind) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if err := ctx.Err(); err != nil {
-		thread.Cancel("context done: " + err.Error()) // run no code at all
+	var kind atomic.Int32
+	cancelWith := func(k cancelKind, reason string) {
+		// Only the first source cancels the thread (thread.Cancel is
+		// first-reason-wins too), so kind and the thread's reason agree.
+		if kind.CompareAndSwap(int32(cancelNone), int32(k)) {
+			thread.Cancel(reason)
+		}
 	}
-	stop := context.AfterFunc(ctx, func() { thread.Cancel("context done: " + ctx.Err().Error()) })
+	if err := ctx.Err(); err != nil {
+		cancelWith(cancelContext, "context done: "+err.Error()) // run no code at all
+	}
+	stop := context.AfterFunc(ctx, func() { cancelWith(cancelContext, "context done: "+ctx.Err().Error()) })
 	defer stop()
 	if lim.Timeout > 0 {
-		t := time.AfterFunc(lim.Timeout, func() { thread.Cancel(timeLimitReason) })
+		t := time.AfterFunc(lim.Timeout, func() { cancelWith(cancelTimeout, timeLimitReason) })
 		defer t.Stop()
 	}
-	return fn()
+	v, err := fn()
+	return v, err, cancelKind(kind.Load())
+}
+
+// IsCancellation reports whether err's chain contains Starlark's
+// cancellation error for the given thread.Cancel reason, as opposed to a
+// genuine error (for example from a host built-in) that returned after a
+// deadline. Module load failures are checked through *modules.Error.
+// Hosts building on Run and Failure use it to compute Failure's timedOut
+// argument exactly as Exec and Call do.
+func IsCancellation(err error, reason string) bool {
+	marker := "Starlark computation cancelled: " + reason
+	for err != nil {
+		switch e := err.(type) {
+		case *starlark.EvalError:
+			if strings.Contains(e.Msg, marker) {
+				return true
+			}
+		case *modules.Error:
+			if strings.Contains(e.Msg, marker) {
+				return true
+			}
+		default:
+			if err.Error() == marker {
+				return true
+			}
+		}
+		err = errors.Unwrap(err)
+	}
+	return false
 }
 
 // Call calls fn(*args) on a fresh thread under lim, and returns its result
@@ -187,7 +241,7 @@ func Call(ctx context.Context, lim Limits, name string, fn starlark.Callable, ar
 		ctx = context.Background()
 	}
 	thread := NewThread(name, lim, print)
-	v, err := Run(ctx, lim, thread, func() (starlark.Value, error) {
+	v, err, kind := runTracked(ctx, lim, thread, func() (starlark.Value, error) {
 		return starlark.Call(thread, fn, args, nil)
 	})
 	steps := thread.ExecutionSteps()
@@ -196,13 +250,14 @@ func Call(ctx context.Context, lim Limits, name string, fn starlark.Callable, ar
 		if f, ok := fn.(*starlark.Function); ok {
 			file = f.Position().Filename()
 		}
-		timedOut := lim.Timeout > 0 && ctx.Err() == nil && isTimeLimit(err)
+		// A timeout only when the timer actually fired first and the
+		// error is the resulting cancellation: a genuine error that
+		// returned after the deadline keeps its own message.
+		timedOut := kind == cancelTimeout && ctx.Err() == nil && IsCancellation(err, timeLimitReason)
 		return nil, steps, Failure(ctx, file, err, timedOut, steps)
 	}
 	return v, steps, nil
 }
-
-func isTimeLimit(err error) bool { return strings.Contains(err.Error(), timeLimitReason) }
 
 // Failure classifies err from running filename into an *Error: positions and
 // backtrace from Starlark errors, Cancelled when ctx has ended, else
@@ -336,12 +391,21 @@ func Exec(ctx context.Context, p Program, opts Options) (Result, error) {
 		}
 		return starlark.Call(thread, fn, args, nil)
 	})
+	convertedCancel := false
 	if err == nil && runCtx.Err() != nil {
 		err = runCtx.Err()
+		convertedCancel = true
 	}
 	steps := thread.ExecutionSteps()
 	if err != nil {
-		timedOut := opts.Limits.Timeout > 0 && ctx.Err() == nil && runCtx.Err() != nil
+		// Timed out only when this Exec's own deadline (not the
+		// caller's context) ended the run: either the run was
+		// converted from a success that finished after it, or the
+		// error is the deadline's cancellation. A genuine error that
+		// merely returned after the deadline keeps its own message.
+		timedOut := opts.Limits.Timeout > 0 && ctx.Err() == nil &&
+			errors.Is(runCtx.Err(), context.DeadlineExceeded) &&
+			(convertedCancel || IsCancellation(err, "context done: "+context.DeadlineExceeded.Error()))
 		return Result{Steps: steps}, Failure(ctx, filename, err, timedOut, steps)
 	}
 	raw, err := values.ToJSON(value)

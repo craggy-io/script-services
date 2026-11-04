@@ -45,6 +45,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"go.starlark.net/resolve"
 	"go.starlark.net/starlark"
@@ -297,10 +298,15 @@ type entry struct {
 	retry   bool // execution was cut short by its context; not cached
 }
 
+// loaderSeq gives each Loader a process-unique thread-local key: a %p key
+// could collide if a Loader were freed and another allocated at its
+// address while a thread retained the old record.
+var loaderSeq atomic.Uint64
+
 // NewLoader returns a Loader reading from src.
 func NewLoader(src Source, opts Options) *Loader {
 	l := &Loader{src: src, opts: opts, entries: map[string]*entry{}, waits: map[string]string{}}
-	l.key = fmt.Sprintf("craggy-script/modules.Loader:%p", l)
+	l.key = fmt.Sprintf("craggy-script/modules.Loader:%d", loaderSeq.Add(1))
 	return l
 }
 
@@ -317,11 +323,18 @@ func (l *Loader) record(thread *starlark.Thread) *record {
 	return r
 }
 
+func orBackground(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
+}
+
 // Bind installs thread.Load so that load() statements of programs on thread
 // load through l. from is the loading file's path (for "./" and "../"
-// specs). Loads run under ctx.
+// specs). Loads run under ctx; a nil ctx is context.Background().
 func (l *Loader) Bind(ctx context.Context, thread *starlark.Thread, from string) {
-	l.bind(ctx, thread, from, "")
+	l.bind(orBackground(ctx), thread, from, "")
 }
 
 func (l *Loader) bind(ctx context.Context, thread *starlark.Thread, from, waiter string) {
@@ -395,8 +408,9 @@ func sortedRefs(m map[string]Ref) []Ref {
 }
 
 // Module loads the module at the canonical path p and returns its frozen
-// globals and Ref.
+// globals and Ref. A nil ctx is context.Background().
 func (l *Loader) Module(ctx context.Context, p string) (starlark.StringDict, Ref, error) {
+	ctx = orBackground(ctx)
 	canon, err := Resolve("", "//"+p)
 	if err != nil {
 		return nil, Ref{}, err
@@ -424,17 +438,31 @@ func (l *Loader) load(ctx context.Context, parent *starlark.Thread, waiter, p st
 				l.waits[waiter] = p
 			}
 			l.mu.Unlock()
-			l.exec(ctx, parent, e)
+			// A panic from a host Source or built-in must not wedge
+			// the entry: record it for waiters, drop the entry so
+			// later loads retry, release waiters, then re-panic.
+			panicVal := func() (pv any) {
+				defer func() { pv = recover() }()
+				l.exec(ctx, parent, e)
+				return nil
+			}()
 			l.mu.Lock()
 			if waiter != "" {
 				delete(l.waits, waiter)
 			}
-			if e.err != nil && ctx.Err() != nil {
+			switch {
+			case panicVal != nil:
+				e.err = &Error{Path: p, Msg: fmt.Sprintf("panic: %v", panicVal), err: fmt.Errorf("panic loading %s: %v", p, panicVal)}
+				delete(l.entries, p)
+			case e.err != nil && ctx.Err() != nil:
 				e.retry = true
 				delete(l.entries, p)
 			}
 			close(e.done)
 			l.mu.Unlock()
+			if panicVal != nil {
+				panic(panicVal)
+			}
 			return e, e.err
 		}
 		select {
@@ -442,7 +470,7 @@ func (l *Loader) load(ctx context.Context, parent *starlark.Thread, waiter, p st
 			l.mu.Unlock()
 			if e.retry {
 				if err := ctx.Err(); err != nil {
-					return nil, err
+					return nil, &Error{Path: p, Msg: err.Error(), err: err}
 				}
 				continue
 			}
@@ -470,7 +498,7 @@ func (l *Loader) load(ctx context.Context, parent *starlark.Thread, waiter, p st
 			l.mu.Unlock()
 		}
 		if err != nil {
-			return nil, err
+			return nil, &Error{Path: p, Msg: err.Error(), err: err}
 		}
 		if e.retry {
 			continue
