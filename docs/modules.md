@@ -13,11 +13,9 @@ execute each module once, and give every result a content address.
 
 - Five spellings of a load path (`./`, `../`, `//`, bare, and `@alias/` for a
   dependency bundle), all canonicalised and confined to their tree's root.
-- Sources: `FromContribution`, the one Source for scripts loaded from bundles
-  (its own bundle's files, and declared dependencies under `@alias/`); the
-  primitives `Map` (in memory), `Dir` (any `fs.FS`) and `DirRoot` (a directory
-  through `os.Root`), which remain only until their last consumers move to
-  bundles.
+- Sources: `FromContribution`, the one Source for authored content, which loads
+  through bundles (its own bundle's files, and declared dependencies under
+  `@alias/`); and `Map`, in memory, for tests and in-memory primitives.
 - Native modules: Go values a `load()` names by exact spec (`Options.Native`),
   with a versioned digest.
 - `Address`: the digest a run would report, computed statically.
@@ -94,19 +92,11 @@ A top-level program passes its own file name as `from`; `script.Exec` uses
   fails with an error naming the alias (not `fs.ErrNotExist`). A dependency's own
   `@alias` loads use the same aliases. Nothing is looked up across several file
   systems in order.
-- `DirRoot(dir)` is the Source for a directory on disk. It opens `dir` as an
-  `os.Root`, so a path, `..` or symbolic link that would leave the directory
-  fails to read (a symbolic link that stays inside works). It returns a
-  `*RootSource`, which holds the directory open: `Close` it when nothing reads
-  through it any more; reads after `Close` fail. `FS()` returns the same
-  confined view as an `fs.FS`. Nothing in this module uses it any more; it stays
-  until capability-services and agent-sdk load their scripts from bundles.
-- `Dir(fsys)` reads any `fs.FS`. Use it for an `embed.FS`, an `fstest.MapFS` or
-  another file system that cannot escape. Avoid `Dir(os.DirFS(dir))`: `os.DirFS`
-  follows symbolic links out of `dir` (`TestDirRootRejectsSymlinkEscape` shows
-  both behaviours).
-- `Map(files)` serves modules from memory, for tests of the Loader itself and of
-  hosts.
+  Reading files from disk, including confinement to the bundle's directory, is
+  foundation-kit's job (`bundle.Dir`), not this package's.
+- `Map(files)` serves modules from memory. It is for tests (of the Loader and of
+  [check](check.md), [script](script.md) and hosts) and for in-memory
+  primitives. Authored content loads through bundles, with `FromContribution`.
 
 ### Native modules
 
@@ -191,9 +181,7 @@ per distinct spec a file loads.
 
 - `type Source interface { Read(ctx context.Context, path string) ([]byte, error) }`
 - `FromContribution(c bundle.Contribution, aliases map[string]string) Source`
-- `Dir(fsys fs.FS) Source`, `Map(files map[string]string) Source`
-- `DirRoot(dir string) (*RootSource, error)`; `*RootSource` implements `Source`
-  and has `FS() fs.FS` and `Close() error`
+- `Map(files map[string]string) Source`
 - `Resolve(from, spec string) (string, error)`
 - `Digest(src []byte, deps []Dep) string`
 - `Address(ctx context.Context, src Source, opts Options, p string, code []byte) (Ref, []Dep, error)`
@@ -212,11 +200,10 @@ per distinct spec a file loads.
 
 ## Semantics, errors, and limits
 
-- `Source.Read` receives canonical paths. `Dir` and `DirRoot` reject paths that
-  are not `fs.ValidPath` and return the file system's errors (for `DirRoot`, also
-  an error for any path or symbolic link leaving the root); `Map` cleans its keys
-  (stripping a leading `/`) and returns an `*fs.PathError` wrapping
-  `fs.ErrNotExist` for a missing path. All check the context first.
+- `Source.Read` receives canonical paths. `FromContribution` rejects paths that
+  are not `fs.ValidPath` and returns the bundle file system's errors; `Map`
+  cleans its keys (stripping a leading `/`) and returns an `*fs.PathError`
+  wrapping `fs.ErrNotExist` for a missing path. Both check the context first.
 - `Bind` installs `thread.Load` so `load()` on that thread goes through the Loader,
   resolving specs against `from`, under `ctx`. `Refs(thread)` then returns every
   module loaded directly or transitively by programs on that thread, sorted by
@@ -253,17 +240,12 @@ From [example_test.go](../modules/example_test.go):
 - `ExampleLoader_Bind` binds a host thread, runs a program that loads
   `./lib/text.star`, and lists `Refs(thread)` (`lib/text.star`,
   `lib/util.star`) and `Deps(thread)` (`./lib/text.star` only).
-- `ExampleDirRoot` loads a module from a directory with `DirRoot` and shows that
-  a symbolic link pointing out of it does not load.
 - `ExampleCycleError` recovers both the `*CycleError` (`[a.star b.star a.star]`)
   and the `*modules.Error` of the module that hit it.
 
 ```go
-src, err := modules.DirRoot(root)
-if err != nil {
-	return err
-}
-defer src.Close()
+// c is a bundle.Contribution of a loaded bundle catalog.
+src := modules.FromContribution(c, nil)
 l := modules.NewLoader(src, modules.Options{
 	Predeclared: starlark.StringDict{"schema": schema.Module()},
 	MaxSteps:    script.DefaultLimits.MaxSteps,

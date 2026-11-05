@@ -76,14 +76,14 @@ beside `bundle.Load`.
 - **The CLI takes bundles only** (`craggy-script check|run|test|types
   BUNDLE[#ID]`, `-dep DIR` for dependencies). Do not add single-file or
   loose-folder arguments.
-- `modules.DirRoot`, `RootSource` and `modules.Dir` have no callers left in this
-  module and remain only for consumers that have not moved to bundles yet; do
-  not add new uses.
+- Authored content loads only through bundles and `modules.FromContribution`.
+  `modules.Map` is for tests and in-memory primitives. Do not add a Source that
+  reads a directory or an `fs.FS`: foundation-kit's `bundle.Dir` owns reading
+  and confining files on disk.
 
 ## Construct the pieces
 
-Nothing here runs background goroutines. The one thing to close is a
-`*modules.RootSource` from `modules.DirRoot`, which holds its directory open.
+Nothing here runs background goroutines, and nothing needs closing.
 
 1. For bundle content, follow the section above: `starcompile.Compiler` gives
    each script a `*starcompile.Unit`, whose `Modules()` is its module source and

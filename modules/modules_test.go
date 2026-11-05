@@ -4,13 +4,10 @@ import (
 	"context"
 	"errors"
 	"io/fs"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
-	"testing/fstest"
 	"time"
 
 	"go.starlark.net/starlark"
@@ -367,14 +364,14 @@ func TestStepLimitAndErrorPositions(t *testing.T) {
 	}
 }
 
-func TestDirSourcePredeclaredAndPrint(t *testing.T) {
-	fsys := fstest.MapFS{
-		"lib/m.star": {Data: []byte("print('loading')\nV = host()\n")},
-	}
+func TestLoaderPredeclaredAndPrint(t *testing.T) {
+	src := modules.Map(map[string]string{
+		"lib/m.star": "print('loading')\nV = host()\n",
+	})
 	pre := starlark.StringDict{"host": starlark.NewBuiltin("host", func(*starlark.Thread, *starlark.Builtin, starlark.Tuple, []starlark.Tuple) (starlark.Value, error) {
 		return starlark.String("h"), nil
 	})}
-	l := modules.NewLoader(modules.Dir(fsys), modules.Options{Predeclared: pre})
+	l := modules.NewLoader(src, modules.Options{Predeclared: pre})
 	var printed []string
 	th := &starlark.Thread{Print: func(th *starlark.Thread, msg string) {
 		printed = append(printed, th.CallFrame(1).Pos.String()+" "+msg)
@@ -390,9 +387,6 @@ func TestDirSourcePredeclaredAndPrint(t *testing.T) {
 	}
 	if len(printed) != 1 || printed[0] != "lib/m.star:1:6 loading" {
 		t.Fatalf("printed = %q", printed)
-	}
-	if _, err := modules.Dir(fsys).Read(context.Background(), "/abs.star"); err == nil {
-		t.Fatal("Dir accepted an invalid path")
 	}
 }
 
@@ -418,79 +412,6 @@ func TestDigestSwapCollision(t *testing.T) {
 	}
 	if ref1.Digest == ref2.Digest {
 		t.Fatalf("swapped dependencies share digest %s but compute %v and %v", ref1.Digest, out1, out2)
-	}
-}
-
-// symlinkTree builds root/{ok.star, inner.star -> ok.star, escape.star ->
-// ../outside/secret.star, out -> ../outside} and returns root.
-func symlinkTree(t *testing.T) string {
-	t.Helper()
-	base := t.TempDir()
-	root, outside := filepath.Join(base, "root"), filepath.Join(base, "outside")
-	for _, d := range []string{root, outside} {
-		if err := os.Mkdir(d, 0o755); err != nil {
-			t.Fatal(err)
-		}
-	}
-	write := func(p, s string) {
-		if err := os.WriteFile(p, []byte(s), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	write(filepath.Join(root, "ok.star"), "V = 'inside'\n")
-	write(filepath.Join(outside, "secret.star"), "V = 'outside'\n")
-	links := map[string]string{
-		"inner.star":  "ok.star",
-		"escape.star": filepath.Join("..", "outside", "secret.star"),
-		"out":         filepath.Join("..", "outside"),
-	}
-	for name, target := range links {
-		if err := os.Symlink(target, filepath.Join(root, name)); err != nil {
-			t.Skipf("symlinks unsupported: %v", err)
-		}
-	}
-	return root
-}
-
-func TestDirRootRejectsSymlinkEscape(t *testing.T) {
-	root := symlinkTree(t)
-	ctx := context.Background()
-	// The hazard DirRoot exists for: os.DirFS follows the link out.
-	if b, err := modules.Dir(os.DirFS(root)).Read(ctx, "escape.star"); err != nil || !strings.Contains(string(b), "outside") {
-		t.Fatalf("os.DirFS fixture: %q, %v", b, err)
-	}
-	src, err := modules.DirRoot(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer src.Close()
-	if b, err := src.Read(ctx, "ok.star"); err != nil || string(b) != "V = 'inside'\n" {
-		t.Fatalf("ok.star = %q, %v", b, err)
-	}
-	if b, err := src.Read(ctx, "inner.star"); err != nil || string(b) != "V = 'inside'\n" {
-		t.Fatalf("symlink inside the root = %q, %v", b, err)
-	}
-	for _, p := range []string{"escape.star", "out/secret.star"} {
-		if b, err := src.Read(ctx, p); err == nil {
-			t.Fatalf("Read(%q) escaped the root: %q", p, b)
-		}
-	}
-	// Through a Loader, the escape is a module error naming the module.
-	l := modules.NewLoader(src, modules.Options{})
-	if _, _, err := l.Module(ctx, "escape.star"); err == nil {
-		t.Fatal("Loader loaded a module outside the root")
-	}
-	if _, err := fs.ReadFile(src.FS(), "ok.star"); err != nil {
-		t.Fatalf("FS: %v", err)
-	}
-	if err := src.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := src.Read(ctx, "ok.star"); err == nil {
-		t.Fatal("Read after Close succeeded")
-	}
-	if _, err := modules.DirRoot(filepath.Join(root, "missing")); err == nil {
-		t.Fatal("DirRoot of a missing directory succeeded")
 	}
 }
 

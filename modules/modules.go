@@ -29,13 +29,11 @@
 // run by package script gets its digest by the same formula, so one file has
 // one digest whether it runs as a program or loads as a module.
 //
-// Sources. FromContribution is the Source for scripts loaded from bundles
-// (package bundle of foundation-kit): it serves the contribution's own bundle
-// and "@alias/" from the dependencies its bundle.yaml declares. Map serves
-// modules from memory. Dir and DirRoot read a file system or a directory, and
-// remain only until their last consumers load from bundles: DirRoot opens the
-// directory as an os.Root, so neither ".." nor a symbolic link reaches outside
-// it, while Dir(os.DirFS(root)) follows symbolic links out of the root.
+// Sources. FromContribution is the Source for authored content, which loads
+// from bundles (package bundle of foundation-kit): it serves the
+// contribution's own bundle and "@alias/" from the dependencies its
+// bundle.yaml declares. Map serves modules from memory, for tests and
+// in-memory primitives.
 //
 // Address computes a file's Ref without executing anything, equal to what a
 // Loader reports after running it.
@@ -49,7 +47,6 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"os"
 	"path"
 	"sort"
 	"strings"
@@ -71,54 +68,9 @@ type Source interface {
 	Read(ctx context.Context, path string) ([]byte, error)
 }
 
-// Dir is a Source reading modules from a file system rooted at the module
-// root, such as an embed.FS. For a directory on disk use DirRoot instead:
-// os.DirFS follows symbolic links, including ones pointing out of the root.
-func Dir(fsys fs.FS) Source { return dirSource{fsys} }
-
-// RootSource is a Source reading modules from a directory on disk through an
-// os.Root, which rejects any path, ".." or symbolic link that would leave
-// the directory. It holds the directory open: Close it when no Loader or
-// check needs it any more. It is safe for concurrent use.
-type RootSource struct {
-	root *os.Root
-	fsys fs.FS
-}
-
-// DirRoot opens dir as the module root. Reads that would escape it through a
-// symbolic link fail, as do all reads after Close.
-func DirRoot(dir string) (*RootSource, error) {
-	r, err := os.OpenRoot(dir)
-	if err != nil {
-		return nil, err
-	}
-	return &RootSource{root: r, fsys: r.FS()}, nil
-}
-
-// Read returns the source of the module at the canonical path p.
-func (s *RootSource) Read(ctx context.Context, p string) ([]byte, error) {
-	return dirSource{s.fsys}.Read(ctx, p)
-}
-
-// FS returns the root as an fs.FS confined the same way.
-func (s *RootSource) FS() fs.FS { return s.fsys }
-
-// Close releases the directory.
-func (s *RootSource) Close() error { return s.root.Close() }
-
-type dirSource struct{ fsys fs.FS }
-
-func (d dirSource) Read(ctx context.Context, p string) ([]byte, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if !fs.ValidPath(p) {
-		return nil, &fs.PathError{Op: "read", Path: p, Err: fs.ErrInvalid}
-	}
-	return fs.ReadFile(d.fsys, p)
-}
-
-// Map is a Source serving modules from memory, keyed by path.
+// Map is a Source serving modules from memory, keyed by path. It is for
+// tests (of the Loader and of packages check and script) and for in-memory
+// primitives; authored content loads through bundles (see FromContribution).
 func Map(files map[string]string) Source {
 	m := make(mapSource, len(files))
 	for k, v := range files {

@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 
 	"go.starlark.net/starlark"
 
@@ -100,38 +98,6 @@ func ExampleLoader_Bind() {
 	// lib/text.star
 	// lib/util.star
 	// direct: ./lib/text.star
-}
-
-// DirRoot is the Source for a directory on disk: it reads through an
-// os.Root, so a symbolic link pointing out of the directory cannot be
-// loaded. Close it when done.
-func ExampleDirRoot() {
-	base, err := os.MkdirTemp("", "modules-example")
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-	defer os.RemoveAll(base)
-	dir := filepath.Join(base, "root")
-	_ = os.Mkdir(dir, 0o755)
-	_ = os.WriteFile(filepath.Join(dir, "greet.star"), []byte("HELLO = 'hi'\n"), 0o644)
-	_ = os.WriteFile(filepath.Join(base, "secret.star"), []byte("SECRET = 1\n"), 0o644)
-	_ = os.Symlink(filepath.Join("..", "secret.star"), filepath.Join(dir, "escape.star"))
-
-	src, err := modules.DirRoot(dir)
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-	defer src.Close()
-	l := modules.NewLoader(src, modules.Options{})
-	globals, _, err := l.Module(context.Background(), "greet.star")
-	fmt.Println(globals["HELLO"], err)
-	_, _, err = l.Module(context.Background(), "escape.star")
-	fmt.Println("escape refused:", err != nil)
-	// Output:
-	// "hi" <nil>
-	// escape refused: true
 }
 
 // A load cycle fails with a *CycleError naming the chain; it is reachable
