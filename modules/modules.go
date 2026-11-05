@@ -3,10 +3,14 @@
 // result a content address.
 //
 // Paths. A module is named by a canonical path: slash-separated, relative to
-// the module root, cleaned, ending in ".star" (for example "lib/text.star").
-// In load(), "./x.star" and "../x.star" are relative to the loading file,
-// while "//lib/x.star" and a bare "lib/x.star" are relative to the root.
-// Paths that would escape the root are rejected (see Resolve).
+// the root of its tree, cleaned, ending in ".star" (for example
+// "lib/text.star"). The main tree is the script's own bundle; each dependency
+// bundle is a tree whose paths start with "@alias/" (for example
+// "@lib/text.star"). In load(), "./x.star" and "../x.star" are relative to the
+// loading file, "//lib/x.star" and a bare "lib/x.star" are relative to the
+// root of the loading file's tree, and "@alias/x.star" names a dependency.
+// Paths that would escape their tree are rejected (see Resolve). A spec listed
+// in Options.Native names a Go module instead.
 //
 // Execution. A Loader executes each module at most once, in the Craggy
 // dialect, with its predeclared names, on a child thread of its own bounded
@@ -25,11 +29,16 @@
 // run by package script gets its digest by the same formula, so one file has
 // one digest whether it runs as a program or loads as a module.
 //
-// Sources. DirRoot reads modules from a directory and is the Source to use
-// for a directory on disk: it opens the directory as an os.Root, so neither
-// ".." nor a symbolic link reaches outside it. Dir(os.DirFS(root)) follows
-// symbolic links out of the root; keep Dir for an embed.FS, an fstest.MapFS
-// or another fs.FS that cannot escape.
+// Sources. FromContribution is the Source for scripts loaded from bundles
+// (package bundle of foundation-kit): it serves the contribution's own bundle
+// and "@alias/" from the dependencies its bundle.yaml declares. Map serves
+// modules from memory. Dir and DirRoot read a file system or a directory, and
+// remain only until their last consumers load from bundles: DirRoot opens the
+// directory as an os.Root, so neither ".." nor a symbolic link reaches outside
+// it, while Dir(os.DirFS(root)) follows symbolic links out of the root.
+//
+// Address computes a file's Ref without executing anything, equal to what a
+// Loader reports after running it.
 package modules
 
 import (
@@ -91,8 +100,7 @@ func (s *RootSource) Read(ctx context.Context, p string) ([]byte, error) {
 	return dirSource{s.fsys}.Read(ctx, p)
 }
 
-// FS returns the root as an fs.FS confined the same way, for walking it (for
-// example with startest.Files).
+// FS returns the root as an fs.FS confined the same way.
 func (s *RootSource) FS() fs.FS { return s.fsys }
 
 // Close releases the directory.
@@ -182,10 +190,102 @@ func Digest(src []byte, deps []Dep) string {
 	return "sha256:" + hex.EncodeToString(h.Sum(nil))
 }
 
+// Address computes, without executing anything, the Ref and direct Deps a
+// Loader over src with opts would give the file at the canonical path p
+// whose source is code: it parses code and every module it loads,
+// transitively, and applies Digest bottom-up. Because load() statements are
+// all at top level, the result equals what running the file reports
+// (script.Result.Digest, Loader.Deps). Only opts.Native is used. A missing,
+// unparsable or cyclic module is an error naming it.
+func Address(ctx context.Context, src Source, opts Options, p string, code []byte) (Ref, []Dep, error) {
+	a := addresser{ctx: orBackground(ctx), src: src, native: opts.Native, done: map[string]string{}, busy: map[string]bool{}}
+	deps, err := a.deps(p, code)
+	if err != nil {
+		return Ref{}, nil, err
+	}
+	return Ref{Path: p, Digest: Digest(code, deps)}, deps, nil
+}
+
+type addresser struct {
+	ctx    context.Context
+	src    Source
+	native map[string]Native
+	done   map[string]string // canonical path -> digest
+	busy   map[string]bool   // paths being addressed, for cycles
+	stack  []string
+}
+
+func (a *addresser) deps(p string, code []byte) ([]Dep, error) {
+	f, err := dialect.Parse(p, code)
+	if err != nil {
+		pos, msg := describe(p, err)
+		return nil, &Error{Path: p, Pos: pos, Msg: msg, err: err}
+	}
+	seen := map[string]bool{}
+	var out []Dep
+	for _, stmt := range f.Stmts {
+		ld, ok := stmt.(*syntax.LoadStmt)
+		if !ok {
+			continue
+		}
+		spec, _ := ld.Module.Value.(string)
+		if seen[spec] {
+			continue
+		}
+		seen[spec] = true
+		if n, ok := a.native[spec]; ok {
+			out = append(out, Dep{Spec: spec, Digest: NativeDigest(spec, n.Version)})
+			continue
+		}
+		dp, err := Resolve(p, spec)
+		if err != nil {
+			return nil, &Error{Path: p, Pos: ld.Module.TokenPos, Msg: err.Error(), err: err}
+		}
+		d, err := a.digest(dp)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, Dep{Spec: spec, Digest: d})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Spec < out[j].Spec })
+	return out, nil
+}
+
+func (a *addresser) digest(p string) (string, error) {
+	if d, ok := a.done[p]; ok {
+		return d, nil
+	}
+	if a.busy[p] {
+		i := len(a.stack) - 1
+		for i > 0 && a.stack[i] != p {
+			i--
+		}
+		return "", &CycleError{Chain: append(append([]string(nil), a.stack[i:]...), p)}
+	}
+	code, err := a.src.Read(a.ctx, p)
+	if err != nil {
+		return "", &Error{Path: p, Msg: err.Error(), err: err}
+	}
+	a.busy[p] = true
+	a.stack = append(a.stack, p)
+	deps, err := a.deps(p, code)
+	a.stack = a.stack[:len(a.stack)-1]
+	delete(a.busy, p)
+	if err != nil {
+		return "", err
+	}
+	d := Digest(code, deps)
+	a.done[p] = d
+	return d, nil
+}
+
 // Resolve turns a load() spec into a canonical module path. from is the
 // loading file's path, against which "./" and "../" specs resolve; "//x" and
-// bare "x" specs are relative to the root. Specs must name a ".star" file
-// and must not escape the root.
+// bare "x" specs are relative to the root of the loading file's tree.
+// "@alias/x" names x in the dependency tree alias (see FromContribution) and
+// resolves to the canonical path "@alias/x". A file inside "@alias/" has that
+// tree as its root: its "//" and bare specs stay in it, and ".." cannot leave
+// it. Specs must name a ".star" file and must not escape their root.
 func Resolve(from, spec string) (string, error) {
 	if spec == "" {
 		return "", fmt.Errorf("empty module path")
@@ -193,24 +293,62 @@ func Resolve(from, spec string) (string, error) {
 	if strings.ContainsAny(spec, "\\\x00") {
 		return "", fmt.Errorf("bad module path %q", spec)
 	}
-	var p string
+	root, fromRel := splitTree(path.Clean(from))
+	var rel string
 	switch {
+	case strings.HasPrefix(spec, "@"):
+		alias, rest, ok := strings.Cut(spec[1:], "/")
+		if !ok || !validAlias(alias) || rest == "" {
+			return "", fmt.Errorf("module path %q must be @alias/path, with an alias of letters, digits, '.', '_' and '-'", spec)
+		}
+		root, rel = "@"+alias, path.Clean(rest)
 	case strings.HasPrefix(spec, "//"):
-		p = path.Clean(spec[2:])
+		rel = path.Clean(spec[2:])
 	case strings.HasPrefix(spec, "/"):
 		return "", fmt.Errorf("module path %q is absolute: use //%s for a root path", spec, strings.TrimLeft(spec, "/"))
 	case strings.HasPrefix(spec, "./"), strings.HasPrefix(spec, "../"):
-		p = path.Join(path.Dir(path.Clean(from)), spec)
+		rel = path.Join(path.Dir(fromRel), spec)
 	default:
-		p = path.Clean(spec)
+		rel = path.Clean(spec)
 	}
-	if escapes(p) {
+	if escapes(rel) {
 		return "", fmt.Errorf("module path %q escapes the module root", spec)
 	}
-	if !strings.HasSuffix(p, ".star") || path.Base(p) == ".star" {
+	if strings.HasPrefix(rel, "@") {
+		return "", fmt.Errorf("module path %q names a dependency without @: write @alias/path", spec)
+	}
+	if !strings.HasSuffix(rel, ".star") || path.Base(rel) == ".star" {
 		return "", fmt.Errorf("module path %q must name a .star file", spec)
 	}
-	return p, nil
+	if root == "" {
+		return rel, nil
+	}
+	return root + "/" + rel, nil
+}
+
+// splitTree splits a canonical path into its tree ("" for the main tree, or
+// "@alias") and its path inside that tree.
+func splitTree(p string) (tree, rel string) {
+	if !strings.HasPrefix(p, "@") {
+		return "", p
+	}
+	tree, rel, _ = strings.Cut(p, "/")
+	return tree, rel
+}
+
+// validAlias reports whether a is a usable dependency alias: the characters
+// of a bundle ID, starting and ending with a letter or digit.
+func validAlias(a string) bool {
+	if a == "" {
+		return false
+	}
+	for i, r := range a {
+		alnum := r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9'
+		if !alnum && (i == 0 || i == len(a)-1 || !strings.ContainsRune("._-", r)) {
+			return false
+		}
+	}
+	return true
 }
 
 func escapes(p string) bool {
@@ -274,6 +412,35 @@ type Options struct {
 	// MaxSteps bounds the execution steps of each module's top level; 0
 	// means unbounded.
 	MaxSteps uint64
+	// Native are modules implemented in Go, keyed by the exact load() spec
+	// that names them (for example "@host/http"). A native spec is matched
+	// before path resolution, from programs and modules alike. NewLoader
+	// freezes their members.
+	Native map[string]Native
+}
+
+// Native is a module implemented in Go rather than in a .star file.
+type Native struct {
+	// Members are the names load() can bind from the module.
+	Members starlark.StringDict
+	// Version stands for the members' behaviour in digests: change it
+	// whenever what the members do changes, because their code is not
+	// hashed.
+	Version string
+}
+
+// NativeDigest is the digest a native module contributes to its loaders'
+// digests: a SHA-256, under the domain tag "craggy-native-v1", over the spec
+// and the version, both length-prefixed.
+func NativeDigest(spec, version string) string {
+	h := sha256.New()
+	var n [8]byte
+	for _, s := range []string{"craggy-native-v1", spec, version} {
+		binary.BigEndian.PutUint64(n[:], uint64(len(s)))
+		h.Write(n[:])
+		h.Write([]byte(s))
+	}
+	return "sha256:" + hex.EncodeToString(h.Sum(nil))
 }
 
 // Loader loads modules from one Source, executing each at most once. It is
@@ -305,6 +472,9 @@ var loaderSeq atomic.Uint64
 
 // NewLoader returns a Loader reading from src.
 func NewLoader(src Source, opts Options) *Loader {
+	for _, n := range opts.Native {
+		n.Members.Freeze()
+	}
 	l := &Loader{src: src, opts: opts, entries: map[string]*entry{}, waits: map[string]string{}}
 	l.key = fmt.Sprintf("craggy-script/modules.Loader:%d", loaderSeq.Add(1))
 	return l
@@ -340,6 +510,11 @@ func (l *Loader) Bind(ctx context.Context, thread *starlark.Thread, from string)
 func (l *Loader) bind(ctx context.Context, thread *starlark.Thread, from, waiter string) {
 	l.record(thread)
 	thread.Load = func(th *starlark.Thread, spec string) (starlark.StringDict, error) {
+		if n, ok := l.opts.Native[spec]; ok {
+			e := &entry{path: spec, globals: n.Members, ref: Ref{Path: spec, Digest: NativeDigest(spec, n.Version)}}
+			l.record(th).loaded[spec] = e
+			return e.globals, nil
+		}
 		p, err := Resolve(from, spec)
 		if err != nil {
 			return nil, err
@@ -411,7 +586,11 @@ func sortedRefs(m map[string]Ref) []Ref {
 // globals and Ref. A nil ctx is context.Background().
 func (l *Loader) Module(ctx context.Context, p string) (starlark.StringDict, Ref, error) {
 	ctx = orBackground(ctx)
-	canon, err := Resolve("", "//"+p)
+	spec := p
+	if !strings.HasPrefix(p, "@") {
+		spec = "//" + p
+	}
+	canon, err := Resolve("", spec)
 	if err != nil {
 		return nil, Ref{}, err
 	}

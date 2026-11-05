@@ -15,15 +15,19 @@ package examples (`*/example_test.go`), which `go test` compiles and checks.
 | Convert between Starlark values, Go values and JSON; turn built-in arguments into JSON | [values](docs/values.md) |
 | Derive JSON Schema from Go-syntax `types.go` declarations | [types](docs/types.md) |
 | Let scripts declare schemas; convert what they declare for the host | [schema](docs/schema.md) |
-| Serve `load()`: path resolution, one execution per module, cycles, digests | [modules](docs/modules.md) |
+| Serve `load()`: path resolution, bundle and native sources, one execution per module, cycles, digests | [modules](docs/modules.md) |
 | Run a program and its entry function under limits; classify failures | [script](docs/script.md) |
 | Validate a script statically against the callables a host will provide | [check](docs/check.md) |
-| Run `*_test.star` files from Go tests or tools | [startest](docs/startest.md) |
-| Check, run, test or print schemas from a shell | [craggy-script](docs/cli.md) |
+| Compile a bundle's `.star` contribution for any kind; the generic `craggy.script@1` kind | [starcompile](docs/starcompile.md) |
+| Run the `*_test.star` files a bundle declares (`craggy.script-test@1`) | [startest](docs/startest.md) |
+| Read a bundle's `types.go` (`craggy.types@1`) | [types](docs/types.md) |
+| Check, run, test or print schemas of a bundle from a shell | [craggy-script](docs/cli.md) |
 
 `dialect`, `values` and `types` import nothing else from this module. `modules`
-builds on `dialect`; `script` on `dialect`, `modules` and `values`; `check` and
-`startest` on `script`. `schema` builds on `types` and `values`. Keep host
+builds on `dialect`; `script` on `dialect`, `modules` and `values`; `check` on
+`script`; `starcompile` on `check`; `startest` on `starcompile`. `schema` builds
+on `types` and `values`. `modules`, `types`, `starcompile`, `startest` and the CLI
+import foundation-kit's `bundle` and `kind`, and nothing else from it. Keep host
 semantics (what a callable does, who may call it, what it costs) out of all of
 them: this module only runs, checks and describes scripts.
 
@@ -46,18 +50,47 @@ way: consumers import script-services and bridge to it.
 When a consumer needs something new, add a generic seam here (an option, an
 interface, a callback) and keep the consumer-specific part in the consumer.
 
+## Load scripts from bundles
+
+Authored scripts (shipped content, user folders, runtime installs and test
+fixtures alike) are bundles loaded by foundation-kit's `bundle.Load`, or held in
+a `bundle.Live`. This module provides the compilers; it never adds a loader
+beside `bundle.Load`.
+
+- **Every folder needs a real `bundle.yaml`.** Never generate or synthesize a
+  manifest from a folder layout or file names, in code or in tests: a test
+  fixture writes its `bundle.yaml` bytes (an `fstest.MapFS` entry is fine).
+  Undeclared files are never discovered as scripts or tests; they are only
+  support files that declared scripts `load()`.
+- **One compiler.** A domain declares its kind with `kind.New` next to its Go
+  type and compiles it with `starcompile.Compiler(opts, build)`. Do not build a
+  `modules.NewLoader` over a raw file system in a consumer: `load()` comes from
+  `modules.FromContribution` (the bundle, and `@alias/path` from declared
+  dependencies), which `starcompile` wires in. Put per-file state (collectors)
+  in the built-ins passed to `Unit.Exec`, not in a cache: the compiler must have
+  no side effects, because `bundle.Live` reuses compiled values.
+- **Generic kinds here:** `starcompile.Script` (`craggy.script@1`),
+  `startest.Test` (`craggy.script-test@1`) and `types.Declarations`
+  (`craggy.types@1`). Tests are contributions of their own kind, whose paths end
+  in `_test.star`.
+- **The CLI takes bundles only** (`craggy-script check|run|test|types
+  BUNDLE[#ID]`, `-dep DIR` for dependencies). Do not add single-file or
+  loose-folder arguments.
+- `modules.DirRoot`, `RootSource` and `modules.Dir` have no callers left in this
+  module and remain only for consumers that have not moved to bundles yet; do
+  not add new uses.
+
 ## Construct the pieces
 
 Nothing here runs background goroutines. The one thing to close is a
 `*modules.RootSource` from `modules.DirRoot`, which holds its directory open.
 
-1. Module source: `modules.DirRoot(dir)` for a directory on disk (it reads
-   through an `os.Root`, so symbolic links cannot escape the directory; `Close`
-   it when done), `modules.Dir(fsys)` for an `embed.FS` or another `fs.FS` that
-   cannot escape, `modules.Map` for in-memory files, or your own
-   `modules.Source` whose `Read` wraps `fs.ErrNotExist` for missing modules. Do
-   not use `modules.Dir(os.DirFS(dir))`: `os.DirFS` follows symbolic links out
-   of the directory.
+1. For bundle content, follow the section above: `starcompile.Compiler` gives
+   each script a `*starcompile.Unit`, whose `Modules()` is its module source and
+   whose `Loader(predeclared)` and `Exec` cover steps 2 and 3. For a host's own
+   in-memory modules, `modules.Map`, or your own `modules.Source` whose `Read`
+   wraps `fs.ErrNotExist` for missing modules. Go modules a script loads by
+   spec go in `modules.Options.Native` (and `check.Env.Native`).
 2. `modules.NewLoader(src, modules.Options{Predeclared: hostNames, MaxSteps: n})`.
    Modules see only the universe plus `Options.Predeclared`, never a program's
    `input`. `MaxSteps` 0 means module top levels are unbounded in steps.
@@ -69,7 +102,11 @@ Nothing here runs background goroutines. The one thing to close is a
 5. For declared types, `types.Parse(filename, src)` once, then
    `schema.Module(schema.WithTypes(pkg))` in `Predeclared` and the same option to
    `schema.Of`.
-6. For Starlark tests, `startest.Run(t, fsys, startest.Options{...})` in a Go test.
+   In a bundle, a `craggy.types@1` contribution compiled by `types.Compiler`
+   gives the `*types.Package`.
+6. For Starlark tests, `startest.Run(t, bundleFS, startest.Options{...})` in a Go
+   test, where `bundleFS` holds a `bundle.yaml` declaring `craggy.script-test@1`
+   contributions.
 
 A Loader is safe for concurrent use and caches each module's frozen globals for
 its lifetime, failures included (except context cut-offs). It never re-reads a
@@ -78,8 +115,9 @@ Loader when sources change.
 
 ## Context, limits and cancellation
 
-- Pass a context to `Exec`, `Call`, `Run`, `Loader.Module`, `Loader.Bind` and
-  `startest.RunFile`; nil is treated as `context.Background()`. `check` takes no
+- Pass a context to `Exec`, `Call`, `Run`, `Loader.Module`, `Loader.Bind`,
+  `modules.Address`, `starcompile.Unit.Exec`, `startest.Load` and
+  `startest.RunUnit`; nil is treated as `context.Background()`. `check` takes no
   context and reads modules with `context.Background()`.
 - `Exec` implements `Limits.Timeout` as a context deadline, so it also bounds
   module loads. `Limits.MaxSteps` bounds only the program's own thread. Each module
@@ -110,6 +148,11 @@ Use `errors.As` for structure and `errors.Is` for sentinels.
   `EvalError` that reaches the error a host built-in returned, so
   `errors.As(err, &myHostErr)` works. Return typed errors from built-ins for hosts
   to recover.
+- Compiling a bundle contribution reports `bundle.Diagnostic` values (inside a
+  `*bundle.LoadError` from `bundle.Load`) with the bundle, contribution, path,
+  line and a stable code: `script.source`, `script.check`, `script.load` and
+  `script.exec` from `starcompile`, `startest.path`, `types.invalid`, and each
+  domain's own codes. Match on the code, not the message.
 - `*modules.Error` (`Path`, `Pos`, `Msg`) is a module that failed to read, compile
   or run; `Unwrap` reaches the cause (`fs.ErrNotExist` for a missing module).
   `*modules.CycleError` has `Chain`, starting and ending with the same path.

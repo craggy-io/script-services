@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"testing/fstest"
 
 	"go.starlark.net/syntax"
 
@@ -60,11 +61,19 @@ func TestEveryEntryPointAcceptsTheSameDialect(t *testing.T) {
 			if (err == nil) != p.ok {
 				t.Errorf("modules: %v", err)
 			}
-			// startest: the file's top level is the program
-			outs := startest.RunFile(ctx, modules.Map(map[string]string{"p_test.star": p.src + "\ndef test_x():\n    pass\n"}), "p_test.star", startest.Options{})
-			passed := len(outs) == 1 && outs[0].Passed()
+			// startest: the file's top level is the program; a bundle
+			// whose test file fails its check does not load.
+			fsys := fstest.MapFS{
+				"bundle.yaml": {Data: []byte("apiVersion: craggy.io/bundle/v1\nmetadata: {id: dialect.p, version: 1.0.0}\ncontributions:\n  - {id: p, kind: craggy.script-test@1, path: p_test.star}\n")},
+				"p_test.star": {Data: []byte(p.src + "\ndef test_x():\n    pass\n")},
+			}
+			passed := false
+			if defs, err := startest.Load(ctx, fsys, startest.Options{}); err == nil {
+				outs := startest.RunUnit(ctx, defs[0].Value, startest.Options{})
+				passed = len(outs) == 1 && outs[0].Passed()
+			}
 			if passed != p.ok {
-				t.Errorf("startest: %+v", outs)
+				t.Errorf("startest passed = %v", passed)
 			}
 		})
 	}

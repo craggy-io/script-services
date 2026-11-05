@@ -46,6 +46,9 @@
 // (integers are decimal).
 // Recursive types and unsupported types (channels, functions, generics,
 // non-string map keys, other packages' types) are errors with positions.
+//
+// In a bundle, a declaration file is a contribution of kind craggy.types@1
+// (Declarations), compiled by Compiler into its *Package.
 package types
 
 import (

@@ -18,9 +18,10 @@ Foundations:
 
 Loading, declaring and testing:
 
-- [Modules](modules.md): `load()` resolution, sources (`DirRoot` for directories), caching, cycles and content digests.
+- [Modules](modules.md): `load()` resolution, sources (`FromContribution` for bundle scripts), native modules, caching, cycles and content digests.
+- [Starcompile](starcompile.md): the shared compiler from a bundle's `.star` contribution to a checked Unit, and the `craggy.script@1` kind.
 - [Schema](schema.md): the Starlark `schema` module and `schema.Of`.
-- [Startest](startest.md): `*_test.star` files and the `assert` module.
+- [Startest](startest.md): `craggy.script-test@1` test files declared in a bundle, and the `assert` module.
 
 Hosts:
 

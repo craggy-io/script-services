@@ -1,9 +1,13 @@
 // Package startest runs Starlark tests written in the Craggy dialect.
 //
-// A test file is any "*_test.star" file. Its top level runs once; then every
-// global function named test_* runs, in name order, on a fresh thread with
-// the configured limits. A test passes when it returns without error. Test
-// files may load() modules, and see an `assert` module:
+// A test file is a contribution of kind craggy.script-test@1 (Test) in a
+// bundle's bundle.yaml, whose path ends in "_test.star". Only declared
+// contributions run: an undeclared *_test.star file is not discovered. Its
+// top level runs once; then every global function named test_* runs, in
+// name order, on a fresh thread with the configured limits. A test passes
+// when it returns without error. Test files may load() modules of their
+// bundle and, as "@alias/x.star", of the bundles it declares as
+// dependencies, and see an `assert` module:
 //
 //	assert.eq(got, want, msg = "")       # got == want
 //	assert.ne(got, other, msg = "")      # got != other
@@ -13,16 +17,15 @@
 //	assert.fails(fn, substring)          # fn() fails with an error containing substring;
 //	                                     # returns the error message
 //
-// From Go tests, Run registers each file and test as t.Run subtests. Read a
-// directory through modules.DirRoot, so symbolic links cannot escape it:
+// From Go tests, Run loads a bundle and registers each test file and test
+// as t.Run subtests:
+//
+//	//go:embed testdata/scripts
+//	var scripts embed.FS
 //
 //	func TestStarlark(t *testing.T) {
-//		src, err := modules.DirRoot("testdata")
-//		if err != nil {
-//			t.Fatal(err)
-//		}
-//		defer src.Close()
-//		startest.Run(t, src.FS(), startest.Options{})
+//		root, _ := fs.Sub(scripts, "testdata/scripts") // holds bundle.yaml
+//		startest.Run(t, root, startest.Options{})
 //	}
 //
 // Limits bound the file's top level (including the modules it loads) and each
@@ -43,10 +46,23 @@ import (
 	"go.starlark.net/starlarkstruct"
 	"go.starlark.net/syntax"
 
+	"github.com/craggy-io/foundation-kit/bundle"
+	"github.com/craggy-io/foundation-kit/kind"
+
+	"github.com/craggy-io/script-services/check"
 	"github.com/craggy-io/script-services/dialect"
 	"github.com/craggy-io/script-services/modules"
 	"github.com/craggy-io/script-services/script"
+	"github.com/craggy-io/script-services/starcompile"
 )
+
+// Test is the kind of a Starlark test file, craggy.script-test@1. Its value
+// is the checked file, which RunUnit runs.
+var Test = kind.New[*starcompile.Unit]("craggy.script-test", 1)
+
+// CodePath is the diagnostic for a Test contribution whose path does not end
+// in "_test.star".
+const CodePath bundle.Code = "startest.path"
 
 // Options configure a test run.
 type Options struct {
@@ -56,9 +72,55 @@ type Options struct {
 	// Limits bound the file's top level and each test separately. Zero
 	// means script.DefaultLimits.
 	Limits script.Limits
-	// Modules serves the test files' load() statements. When nil, modules
-	// load from the same place as the test files.
-	Modules modules.Source
+	// Aliases and Native are as in starcompile.Options.
+	Aliases map[string]string
+	Native  map[string]modules.Native
+	// Dependencies are the bundles Run loads beside the one under test, so
+	// that its declared dependencies resolve.
+	Dependencies []bundle.Source
+	// Compilers are the other kinds Run must compile, when the bundle under
+	// test or a dependency also holds contributions of other kinds.
+	Compilers []bundle.AnyCompiler
+}
+
+func (o Options) predeclared() starlark.StringDict {
+	out := starlark.StringDict{"assert": Assert()}
+	for k, v := range o.Predeclared {
+		out[k] = v
+	}
+	return out
+}
+
+func (o Options) limits() script.Limits {
+	if o.Limits == (script.Limits{}) {
+		return script.DefaultLimits
+	}
+	return o.Limits
+}
+
+// Compiler returns the compiler for Test under opts. Test files are checked
+// with assert and opts.Predeclared predeclared, for themselves and for the
+// modules they load.
+func Compiler(opts Options) bundle.AnyCompiler {
+	pre := opts.predeclared()
+	names := make([]string, 0, len(pre))
+	for k := range pre {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	sc := starcompile.Options{
+		Aliases:           opts.Aliases,
+		Check:             check.Env{Predeclared: names},
+		ModulePredeclared: pre,
+		Native:            opts.Native,
+		Limits:            opts.limits(),
+	}
+	return bundle.Compile(Test, starcompile.Compiler(sc, func(_ context.Context, u *starcompile.Unit) (bundle.Compiled[*starcompile.Unit], []bundle.Diagnostic) {
+		if !IsTestFile(u.Path()) {
+			return bundle.Compiled[*starcompile.Unit]{}, []bundle.Diagnostic{u.Errorf(CodePath, script.Position{}, "test file %s must end in _test.star", u.Path())}
+		}
+		return bundle.Compiled[*starcompile.Unit]{Value: u}, nil
+	}))
 }
 
 // Outcome is the result of one test, or of a test file's top level when
@@ -66,7 +128,7 @@ type Options struct {
 // when it passes but printed: its Output holds what the top level (and the
 // modules it loaded) printed, so that output is never charged to a test.
 type Outcome struct {
-	File   string        `json:"file"`             // test file path
+	File   string        `json:"file"`             // test file path in its bundle
 	Test   string        `json:"test,omitempty"`   // test function; empty for the file's top level
 	Err    *script.Error `json:"error,omitempty"`  // nil when the test (or top level) passed
 	Steps  uint64        `json:"steps"`            // execution steps the test (or top level) used
@@ -84,40 +146,53 @@ func (o Outcome) Name() string {
 	return o.File + "::" + o.Test
 }
 
-// IsTestFile reports whether p names a Starlark test file.
+// IsTestFile reports whether p names a Starlark test file, which a Test
+// contribution's path must.
 func IsTestFile(p string) bool { return strings.HasSuffix(p, "_test.star") }
 
-// Files returns every test file in fsys, sorted.
-func Files(fsys fs.FS) ([]string, error) {
-	var out []string
-	err := fs.WalkDir(fsys, ".", func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if !d.IsDir() && IsTestFile(p) {
-			out = append(out, p)
-		}
-		return nil
+// Load loads the bundle rooted at fsys, which must contain bundle.yaml, with
+// opts.Dependencies, and returns its Test definitions sorted by path. It
+// fails when the bundle declares none.
+func Load(ctx context.Context, fsys fs.FS, opts Options) ([]bundle.Definition[*starcompile.Unit], error) {
+	const origin = "startest"
+	cat, err := bundle.Load(ctx, bundle.Options{
+		Sources:   append([]bundle.Source{bundle.Embedded(origin, fsys)}, opts.Dependencies...),
+		Compilers: append([]bundle.AnyCompiler{Compiler(opts)}, opts.Compilers...),
 	})
-	sort.Strings(out)
-	return out, err
+	if err != nil {
+		return nil, err
+	}
+	var out []bundle.Definition[*starcompile.Unit]
+	for _, def := range bundle.All(cat, Test) {
+		if def.Owner.Origin == origin {
+			out = append(out, def)
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("startest: the bundle declares no %s contributions", Test.ID())
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Value.Path() < out[j].Value.Path() })
+	return out, nil
 }
 
-// Run runs every test file in fsys as a subtest of t, and each of its tests
-// as a subtest of that.
+// Run loads the bundle rooted at fsys (see Load) and runs every test file it
+// declares as a subtest of t, and each of its tests as a subtest of that. A
+// bundle that fails to load fails t with every diagnostic.
 func Run(t *testing.T, fsys fs.FS, opts Options) {
 	t.Helper()
-	files, err := Files(fsys)
+	defs, err := Load(t.Context(), fsys, opts)
 	if err != nil {
+		var le *bundle.LoadError
+		if errors.As(err, &le) {
+			for _, d := range le.Diagnostics {
+				t.Errorf("%s:%d:%d: %s: %s", d.Path, d.Line, d.Column, d.Code, d.Message)
+			}
+		}
 		t.Fatalf("startest: %v", err)
 	}
-	if len(files) == 0 {
-		t.Fatalf("startest: no *_test.star files")
-	}
-	src := modules.Dir(fsys)
-	for _, file := range files {
-		t.Run(file, func(t *testing.T) {
-			for _, o := range RunFile(t.Context(), src, file, opts) {
+	for _, def := range defs {
+		t.Run(def.Value.Path(), func(t *testing.T) {
+			for _, o := range RunUnit(t.Context(), def.Value, opts) {
 				report := func(t *testing.T) {
 					for _, line := range o.Output {
 						t.Log(line)
@@ -140,33 +215,25 @@ func Run(t *testing.T, fsys fs.FS, opts Options) {
 	}
 }
 
-// RunFile runs the tests in the test file at path in src. A file whose top
-// level fails yields one outcome with an empty Test. Otherwise there is one
-// outcome per test_* function, preceded by a passing file-level outcome
-// (empty Test) carrying the top level's print() output when it printed. A
-// file defining no test_* functions yields one failing file-level outcome:
-// a test file with no tests is a failure, not a pass, so renamed or
-// mistyped test names cannot silently green a run.
+// RunUnit runs the tests in one test file, normally a Test definition's
+// value. opts should be the Options its compiler was built with. A file
+// whose top level fails yields one outcome with an empty Test. Otherwise
+// there is one outcome per test_* function, preceded by a passing
+// file-level outcome (empty Test) carrying the top level's print() output
+// when it printed. A file defining no test_* functions yields one failing
+// file-level outcome: a test file with no tests is a failure, not a pass, so
+// renamed or mistyped test names cannot silently green a run.
 //
 // opts.Limits.Timeout bounds the top level including the modules it loads;
 // running out is an Invalid error with TimedOut set, as in script.Exec.
-func RunFile(ctx context.Context, src modules.Source, p string, opts Options) []Outcome {
+func RunUnit(ctx context.Context, u *starcompile.Unit, opts Options) []Outcome {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	lim := opts.Limits
-	if lim == (script.Limits{}) {
-		lim = script.DefaultLimits
-	}
-	modSrc := opts.Modules
-	if modSrc == nil {
-		modSrc = src
-	}
-	predeclared := starlark.StringDict{"assert": Assert()}
-	for k, v := range opts.Predeclared {
-		predeclared[k] = v
-	}
-	loader := modules.NewLoader(modSrc, modules.Options{Predeclared: predeclared, MaxSteps: lim.MaxSteps})
+	p := u.Path()
+	lim := opts.limits()
+	predeclared := opts.predeclared()
+	loader := u.Loader(predeclared)
 
 	var output []string
 	print := func(th *starlark.Thread, msg string) {
@@ -175,13 +242,7 @@ func RunFile(ctx context.Context, src modules.Source, p string, opts Options) []
 	}
 	flush := func() []string { o := output; output = nil; return o }
 
-	fileFail := func(err error, steps uint64) []Outcome {
-		return []Outcome{{File: p, Err: script.Failure(ctx, p, err, false, steps), Steps: steps, Output: flush()}}
-	}
-	data, err := src.Read(ctx, p)
-	if err != nil {
-		return fileFail(err, 0)
-	}
+	data := u.Source()
 	// As in script.Exec, the timeout is a context deadline so module loads
 	// honour it too; it is told apart from the caller's own cancellation.
 	runCtx, cancel := ctx, context.CancelFunc(func() {})
@@ -191,7 +252,7 @@ func RunFile(ctx context.Context, src modules.Source, p string, opts Options) []
 	thread := script.NewThread("test:"+p, lim, print)
 	loader.Bind(runCtx, thread, p)
 	var globals starlark.StringDict
-	_, err = script.Run(runCtx, script.Limits{}, thread, func() (starlark.Value, error) {
+	_, err := script.Run(runCtx, script.Limits{}, thread, func() (starlark.Value, error) {
 		prog, err := dialect.Compile(p, data, predeclared.Has)
 		if err != nil {
 			return nil, err
