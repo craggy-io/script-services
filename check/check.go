@@ -70,6 +70,11 @@ type Env struct {
 	RefFuncs map[string]func(ref string) (Callable, bool)
 	// Modules, when set, is where load() targets are looked up.
 	Modules modules.Source
+	// Native are the Go modules the host's Loader serves
+	// (modules.Options.Native), keyed by load() spec. A load of one of
+	// these specs is checked against its members' names, without
+	// consulting Modules.
+	Native map[string]modules.Native
 	// ModulePredeclared are the names load()ed modules will see besides
 	// the Starlark universe: the keys of the Predeclared the host passes
 	// to modules.NewLoader. Module files are resolved against exactly
@@ -92,8 +97,8 @@ type Analysis struct {
 	// Uses is every callable a direct call or a literal ref resolves to,
 	// once each by Name, in source order.
 	Uses []Callable
-	// Loads are the canonical paths of the script's load() targets, once
-	// each, in source order.
+	// Loads are the canonical paths of the script's load() targets (the
+	// spec itself for a native module), once each, in source order.
 	Loads []string
 }
 
@@ -174,7 +179,7 @@ func Analyze(env Env, filename string, src []byte) Analysis {
 	}
 	for _, stmt := range f.Stmts {
 		if ld, ok := stmt.(*syntax.LoadStmt); ok {
-			c.checkLoad(env.Modules, ld)
+			c.checkLoad(env, ld)
 		}
 	}
 	syntax.Walk(f, c.visit)
@@ -247,20 +252,20 @@ func (c *checker) add(pos syntax.Position, severity, msg string) {
 	c.diags = append(c.diags, Diagnostic{Pos: script.PositionOf(pos), Severity: severity, Message: msg})
 }
 
-func (c *checker) checkLoad(src modules.Source, ld *syntax.LoadStmt) {
+func (c *checker) checkLoad(env Env, ld *syntax.LoadStmt) {
 	spec, _ := ld.Module.Value.(string)
+	if n, ok := env.Native[spec]; ok {
+		c.addLoad(spec)
+		c.checkNames(ld, spec, spec, func(name string) bool { return n.Members.Has(name) }, n.Members.Keys())
+		return
+	}
+	src := env.Modules
 	p, err := modules.Resolve(c.filename, spec)
 	if err != nil {
 		c.add(ld.Module.TokenPos, "error", fmt.Sprintf("load %q: %v", spec, err))
 		return
 	}
-	seen := false
-	for _, l := range c.loads {
-		seen = seen || l == p
-	}
-	if !seen {
-		c.loads = append(c.loads, p)
-	}
+	c.addLoad(p)
 	if src == nil {
 		return
 	}
@@ -300,8 +305,23 @@ func (c *checker) checkLoad(src modules.Source, ld *syntax.LoadStmt) {
 			names = append(names, b.First.Name)
 		}
 	}
+	c.checkNames(ld, spec, p, func(name string) bool { return defined[name] }, names)
+}
+
+// addLoad records a load target once, in source order.
+func (c *checker) addLoad(p string) {
+	for _, l := range c.loads {
+		if l == p {
+			return
+		}
+	}
+	c.loads = append(c.loads, p)
+}
+
+// checkNames reports each name ld binds that the module p does not define.
+func (c *checker) checkNames(ld *syntax.LoadStmt, spec, p string, defined func(string) bool, names []string) {
 	for _, from := range ld.From {
-		if defined[from.Name] || strings.HasPrefix(from.Name, "_") {
+		if defined(from.Name) || strings.HasPrefix(from.Name, "_") {
 			continue // private names are already a resolve error
 		}
 		msg := fmt.Sprintf("load %q: %s does not define %s", spec, p, from.Name)

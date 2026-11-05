@@ -135,6 +135,17 @@ and adds the base64 description to `For`'s side, so it pins everything else.
 - `(*Package).Has(name string) bool`
 - `(*Package).Schema(name string) (*jsonschema.Schema, error)`
 - `type Error struct { Pos token.Position; Msg string }`
+- `var Declarations = kind.New[*Package]("craggy.types", 1)`; `Compiler() bundle.AnyCompiler`;
+  `const CodeInvalid bundle.Code = "types.invalid"`
+
+### Declarations in bundles
+
+A `types.go` file shipped in a bundle is a contribution of kind `craggy.types@1`
+whose path names a `.go` file. `Compiler` parses it and derives every declared
+type's schema, so a file that does not parse, or a type with no schema, is a
+`types.invalid` load diagnostic with its line. The definition's value is the
+`*Package`, ready for `schema.WithTypes`. The [CLI](cli.md) `types` command reads
+it this way.
 
 ## Semantics, errors, and limits
 

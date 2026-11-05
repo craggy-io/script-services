@@ -79,7 +79,8 @@ within `max(2, len/3)` edits.
 
 - `Check(env Env, filename string, src []byte) []Diagnostic`
 - `Analyze(env Env, filename string, src []byte) Analysis`
-- `type Env struct { Callables []Callable; Predeclared []string; RefFuncs map[string]func(ref string) (Callable, bool); Modules modules.Source; ModulePredeclared []string; Noun string }`
+- `type Env struct { Callables []Callable; Predeclared []string; RefFuncs map[string]func(ref string) (Callable, bool); Modules modules.Source; Native map[string]modules.Native; ModulePredeclared []string; Noun string }`
+- `Env.Native` lists the Go modules the host's Loader serves (`modules.Options.Native`): a `load()` of one of their specs is checked against its members' names and recorded in `Analysis.Loads` as the spec, without reading `Modules`.
 - `type Callable struct { Name string; Input *jsonschema.Schema; Value any }`
 - `type Diagnostic struct { Pos script.Position; Severity, Message string }` (JSON `pos`, `severity`, `message`)
 - `type Analysis struct { Diagnostics []Diagnostic; Uses []Callable; Loads []string }`

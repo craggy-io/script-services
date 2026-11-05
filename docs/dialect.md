@@ -53,7 +53,7 @@ mutating it changes every entry point in the process.
   once.
 - Compile parses, resolves and compiles; its errors are either of the above.
 - [dialect_test.go](../dialect/dialect_test.go) runs the same programs through
-  `check.Check`, `script.Exec`, `modules.Loader.Module` and `startest.RunFile` and
+  `check.Check`, `script.Exec`, `modules.Loader.Module` and `startest.RunUnit` and
   requires all four to accept or reject each one identically, and verifies that
   recursion is rejected by Exec and by module loading.
 

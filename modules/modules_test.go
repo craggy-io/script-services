@@ -29,6 +29,14 @@ func TestResolve(t *testing.T) {
 		{"lib/a.star", "x/./z/../y.star", "x/y.star"},
 		{"main.star", "./lib/a.star", "lib/a.star"},
 		{"", "./a.star", "a.star"},
+		// Dependency trees: @alias/ is a root of its own.
+		{"main.star", "@lib/x.star", "@lib/x.star"},
+		{"main.star", "@my-lib.v2/a/x.star", "@my-lib.v2/a/x.star"},
+		{"@lib/a/x.star", "./y.star", "@lib/a/y.star"},
+		{"@lib/a/x.star", "../y.star", "@lib/y.star"},
+		{"@lib/a/x.star", "//y.star", "@lib/y.star"},
+		{"@lib/a/x.star", "y.star", "@lib/y.star"},
+		{"@lib/a/x.star", "@other/y.star", "@other/y.star"},
 	}
 	for _, c := range ok {
 		got, err := modules.Resolve(c.from, c.spec)
@@ -47,6 +55,13 @@ func TestResolve(t *testing.T) {
 		{"a.star", "//", "escapes the module root"},
 		{"a.star", "", "empty module path"},
 		{"a.star", `x\y.star`, "bad module path"},
+		{"@lib/x.star", "../y.star", "escapes the module root"},
+		{"@lib/a/x.star", "//../y.star", "escapes the module root"},
+		{"a.star", "@lib/../y.star", "escapes the module root"},
+		{"a.star", "@lib", "must be @alias/path"},
+		{"a.star", "@/x.star", "must be @alias/path"},
+		{"a.star", "@-x/y.star", "must be @alias/path"},
+		{"a.star", "//@lib/x.star", "names a dependency without @"},
 	}
 	for _, c := range bad {
 		if got, err := modules.Resolve(c.from, c.spec); err == nil || !strings.Contains(err.Error(), c.want) {
@@ -476,5 +491,87 @@ func TestDirRootRejectsSymlinkEscape(t *testing.T) {
 	}
 	if _, err := modules.DirRoot(filepath.Join(root, "missing")); err == nil {
 		t.Fatal("DirRoot of a missing directory succeeded")
+	}
+}
+
+// Address computes, without running anything, what a Loader reports after
+// running the file.
+func TestAddressMatchesLoader(t *testing.T) {
+	files := map[string]string{
+		"main.star":  "load('./lib/a.star', 'A')\nload('lib/b.star', 'B')\nload('@host/n', 'N')\n",
+		"lib/a.star": "load('./b.star', 'B')\nA = B\n",
+		"lib/b.star": "B = 1\n",
+	}
+	native := map[string]modules.Native{"@host/n": {Members: starlark.StringDict{"N": starlark.MakeInt(1)}, Version: "v1"}}
+	src := modules.Map(files)
+	ref, deps, err := modules.Address(context.Background(), src, modules.Options{Native: native}, "main.star", []byte(files["main.star"]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := modules.NewLoader(src, modules.Options{Native: native})
+	thread := &starlark.Thread{}
+	l.Bind(context.Background(), thread, "main.star")
+	if _, err := starlark.ExecFileOptions(dialect.FileOptions, thread, "main.star", files["main.star"], nil); err != nil {
+		t.Fatal(err)
+	}
+	if want := modules.Digest([]byte(files["main.star"]), l.Deps(thread)); ref.Digest != want || ref.Path != "main.star" {
+		t.Fatalf("Address = %+v, want digest %s", ref, want)
+	}
+	if len(deps) != 3 || deps[0].Spec != "./lib/a.star" || deps[1].Spec != "@host/n" || deps[1].Digest != modules.NativeDigest("@host/n", "v1") {
+		t.Fatalf("deps = %+v", deps)
+	}
+	var paths []string
+	for _, r := range l.Refs(thread) {
+		paths = append(paths, r.Path)
+	}
+	if strings.Join(paths, ",") != "@host/n,lib/a.star,lib/b.star" {
+		t.Fatalf("Refs = %v", paths)
+	}
+
+	bad := map[string]string{
+		"missing": "load('nope.star', 'x')\n",
+		"cycle":   "load('c1.star', 'x')\n",
+		"syntax":  "load('s.star', 'x')\n",
+	}
+	src = modules.Map(map[string]string{"c1.star": "load('c2.star', 'y')\nx = 1\n", "c2.star": "load('c1.star', 'x')\ny = 1\n", "s.star": "x = (\n"})
+	for name, code := range bad {
+		_, _, err := modules.Address(context.Background(), src, modules.Options{}, "main.star", []byte(code))
+		var me *modules.Error
+		var ce *modules.CycleError
+		switch name {
+		case "missing":
+			if !errors.As(err, &me) || me.Path != "nope.star" || !errors.Is(err, fs.ErrNotExist) {
+				t.Errorf("missing: %v", err)
+			}
+		case "cycle":
+			if !errors.As(err, &ce) || strings.Join(ce.Chain, " -> ") != "c1.star -> c2.star -> c1.star" {
+				t.Errorf("cycle: %v", err)
+			}
+		case "syntax":
+			if !errors.As(err, &me) || me.Path != "s.star" || me.Pos.Line != 2 {
+				t.Errorf("syntax: %v", err)
+			}
+		}
+	}
+}
+
+// A native module is matched by its exact spec, and its members are frozen.
+func TestNativeModules(t *testing.T) {
+	list := starlark.NewList([]starlark.Value{starlark.MakeInt(1)})
+	l := modules.NewLoader(modules.Map(map[string]string{"m.star": "load('@host/n', 'L')\nM = L\n"}),
+		modules.Options{Native: map[string]modules.Native{"@host/n": {Members: starlark.StringDict{"L": list}, Version: "1"}}})
+	g, ref, err := l.Module(context.Background(), "m.star")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g["M"] != list || list.Append(starlark.None) == nil {
+		t.Fatalf("native member not shared or not frozen: %v", g["M"])
+	}
+	want := modules.Digest([]byte("load('@host/n', 'L')\nM = L\n"), []modules.Dep{{Spec: "@host/n", Digest: modules.NativeDigest("@host/n", "1")}})
+	if ref.Digest != want {
+		t.Fatalf("digest = %s, want %s", ref.Digest, want)
+	}
+	if modules.NativeDigest("@host/n", "1") == modules.NativeDigest("@host/n", "2") {
+		t.Fatal("NativeDigest ignores the version")
 	}
 }

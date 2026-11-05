@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/google/jsonschema-go/jsonschema"
+	"go.starlark.net/starlark"
 
 	"github.com/craggy-io/script-services/check"
 	"github.com/craggy-io/script-services/modules"
@@ -208,5 +209,18 @@ func TestNounNamesCallables(t *testing.T) {
 	e.Noun = "capability"
 	if got := lines(check.Check(e, "n.star", []byte(src))); got != want("capability") {
 		t.Fatalf("capability noun:\n%s\nwant:\n%s", got, want("capability"))
+	}
+}
+
+// A native module's load is checked against its members, not read from
+// Modules.
+func TestNativeLoads(t *testing.T) {
+	env := check.Env{Native: map[string]modules.Native{"@host/clock": {Members: starlark.StringDict{"now": starlark.None}}}}
+	a := check.Analyze(env, "s.star", []byte("load('@host/clock', 'now', 'nwo')\n"))
+	if len(a.Diagnostics) != 1 || !strings.Contains(a.Diagnostics[0].Message, "does not define nwo (did you mean now?)") {
+		t.Fatalf("diagnostics = %+v", a.Diagnostics)
+	}
+	if len(a.Loads) != 1 || a.Loads[0] != "@host/clock" {
+		t.Fatalf("loads = %v", a.Loads)
 	}
 }

@@ -8,7 +8,6 @@ import (
 
 	"go.starlark.net/starlark"
 
-	"github.com/craggy-io/script-services/modules"
 	"github.com/craggy-io/script-services/startest"
 )
 
@@ -16,13 +15,13 @@ var errHostFail = errors.New("host failure")
 
 func runOne(t *testing.T, src string, opts startest.Options) []startest.Outcome {
 	t.Helper()
-	return startest.RunFile(context.Background(),
-		modules.Map(map[string]string{"x_test.star": src}), "x_test.star", opts)
+	fsys := bundleFS(xManifest, map[string]string{"x_test.star": src})
+	return startest.RunUnit(context.Background(), unit(t, fsys, "x", opts), opts)
 }
 
 // A test file with no test_* functions used to return zero outcomes and
 // pass everywhere.
-func TestRunFileNoTestsFails(t *testing.T) {
+func TestRunUnitNoTestsFails(t *testing.T) {
 	out := runOne(t, "x = 1\n", startest.Options{})
 	if len(out) != 1 || out[0].Err == nil || out[0].Test != "" {
 		t.Fatalf("no-tests outcomes = %+v", out)
@@ -32,7 +31,7 @@ func TestRunFileNoTestsFails(t *testing.T) {
 	}
 }
 
-func TestRunFileNonFunctionAndBuiltinTests(t *testing.T) {
+func TestRunUnitNonFunctionAndBuiltinTests(t *testing.T) {
 	out := runOne(t, "test_stringy = 'nope'\n", startest.Options{})
 	if len(out) != 1 || out[0].Err == nil || out[0].Test != "test_stringy" {
 		t.Fatalf("stringy outcomes = %+v", out)

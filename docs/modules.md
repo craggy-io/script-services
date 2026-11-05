@@ -11,11 +11,16 @@ execute each module once, and give every result a content address.
 
 ## Features
 
-- Four spellings of a load path (`./`, `../`, `//`, bare), all canonicalised and
-  confined to the module root.
-- Pluggable sources: a directory on disk read through `os.Root` (`DirRoot`, which
-  symbolic links cannot escape), any `fs.FS` (`embed.FS`, `fstest.MapFS`), or an
-  in-memory map.
+- Five spellings of a load path (`./`, `../`, `//`, bare, and `@alias/` for a
+  dependency bundle), all canonicalised and confined to their tree's root.
+- Sources: `FromContribution`, the one Source for scripts loaded from bundles
+  (its own bundle's files, and declared dependencies under `@alias/`); the
+  primitives `Map` (in memory), `Dir` (any `fs.FS`) and `DirRoot` (a directory
+  through `os.Root`), which remain only until their last consumers move to
+  bundles.
+- Native modules: Go values a `load()` names by exact spec (`Options.Native`),
+  with a versioned digest.
+- `Address`: the digest a run would report, computed statically.
 - One execution per module per Loader; concurrent loads of one path share it.
 - Frozen, cached globals; deterministic failures cached too; context cut-offs not.
 - Cycle detection that names the chain, including cycles entered concurrently
@@ -49,18 +54,29 @@ Source), and into tests with `startest.Options.Modules`.
 relative to the module root, cleaned, ending in `.star`. `from` is the loading
 file's canonical path.
 
-| Spec | Resolves against | `from = "lib/text.star"` |
-| --- | --- | --- |
-| `./x.star` | the loading file's directory | `./util.star` → `lib/util.star` |
-| `../x.star` | the loading file's directory | `../top.star` → `top.star` |
-| `//x.star` | the module root | `//lib/x.star` → `lib/x.star` |
-| `x.star` (bare) | the module root | `lib/x.star` → `lib/x.star` |
+There are several trees: the main tree (the script's own bundle) and one tree
+per dependency, whose canonical paths start with `@alias/`. A file's `//` and
+bare specs resolve against the root of its own tree, and `..` cannot leave it.
+
+| Spec | Resolves against | `from = "lib/text.star"` | `from = "@lib/text/up.star"` |
+| --- | --- | --- | --- |
+| `./x.star` | the loading file's directory | `./util.star` → `lib/util.star` | `./b.star` → `@lib/text/b.star` |
+| `../x.star` | the loading file's directory | `../top.star` → `top.star` | `../b.star` → `@lib/b.star` |
+| `//x.star` | its tree's root | `//lib/x.star` → `lib/x.star` | `//b.star` → `@lib/b.star` |
+| `x.star` (bare) | its tree's root | `lib/x.star` → `lib/x.star` | `b.star` → `@lib/b.star` |
+| `@alias/x.star` | the root of dependency `alias` | `@lib/x.star` → `@lib/x.star` | the same |
+
+`@alias` is an alias for a dependency bundle (see `FromContribution`): letters,
+digits, `.`, `_` and `-`, starting and ending with a letter or digit, so a
+bundle ID such as `example.shared-lib` is a valid alias.
 
 Rejected specs:
 
 - empty (`empty module path`), or containing `\` or NUL (`bad module path`);
 - starting with a single `/` (`module path "/etc/x.star" is absolute: use //etc/x.star for a root path`);
 - escaping the root after cleaning, including `//` alone (`escapes the module root`);
+- `@` without `alias/path`, or with an invalid alias (`must be @alias/path`);
+- a path in a tree that starts with `@`, such as `//@lib/x.star` (`names a dependency without @`);
 - not naming a `.star` file (`must name a .star file`).
 
 A top-level program passes its own file name as `from`; `script.Exec` uses
@@ -68,18 +84,49 @@ A top-level program passes its own file name as `from`; `script.Exec` uses
 
 ### Sources
 
+- `FromContribution(c bundle.Contribution, aliases map[string]string)` is the
+  Source for a `.star` contribution of a foundation-kit bundle, and the one that
+  [starcompile](starcompile.md) uses for every kind. It serves main-tree paths
+  from `c.Files` (the bundle's snapshot) and `@alias/x.star` from
+  `c.Dependency(aliases[alias])`, or `c.Dependency(alias)` when `aliases` has no
+  entry, so a dependency's ID is its default alias. The dependency must be
+  declared under `dependencies` in `bundle.yaml` and loaded; otherwise the read
+  fails with an error naming the alias (not `fs.ErrNotExist`). A dependency's own
+  `@alias` loads use the same aliases. Nothing is looked up across several file
+  systems in order.
 - `DirRoot(dir)` is the Source for a directory on disk. It opens `dir` as an
   `os.Root`, so a path, `..` or symbolic link that would leave the directory
   fails to read (a symbolic link that stays inside works). It returns a
   `*RootSource`, which holds the directory open: `Close` it when nothing reads
   through it any more; reads after `Close` fail. `FS()` returns the same
-  confined view as an `fs.FS`, for walking (for example `startest.Files`). The
-  `craggy-script` CLI uses it for every `-root`.
+  confined view as an `fs.FS`. Nothing in this module uses it any more; it stays
+  until capability-services and agent-sdk load their scripts from bundles.
 - `Dir(fsys)` reads any `fs.FS`. Use it for an `embed.FS`, an `fstest.MapFS` or
   another file system that cannot escape. Avoid `Dir(os.DirFS(dir))`: `os.DirFS`
   follows symbolic links out of `dir` (`TestDirRootRejectsSymlinkEscape` shows
   both behaviours).
-- `Map(files)` serves modules from memory.
+- `Map(files)` serves modules from memory, for tests of the Loader itself and of
+  hosts.
+
+### Native modules
+
+`Options.Native` maps an exact `load()` spec, such as `"@host/http"`, to a
+`Native{Members, Version}`. The spec is matched before path resolution, in
+programs and modules alike, and binds names from `Members`, which `NewLoader`
+freezes. Its digest is `NativeDigest(spec, version)`: a SHA-256 under the domain
+tag `craggy-native-v1` over the length-prefixed spec and version. Bump the
+version whenever what the members do changes, because their code is not hashed.
+`check.Env.Native` checks loads of the same specs statically.
+
+### Static addresses
+
+`Address(ctx, src, opts, path, code)` returns the `Ref` and direct `Dep`s that a
+Loader would give the file after running it, without running anything: it
+parses the file and every module it loads, transitively, and applies `Digest`
+bottom-up. Because `load()` statements are all at top level, this equals what a
+run reports. A missing, unparsable or cyclic module is a `*modules.Error` or
+`*CycleError` naming it. [starcompile](starcompile.md) uses it to give every
+compiled script its digest.
 
 ### Execution, caching and coalescing
 
@@ -143,15 +190,18 @@ per distinct spec a file loads.
 ## Public interfaces
 
 - `type Source interface { Read(ctx context.Context, path string) ([]byte, error) }`
+- `FromContribution(c bundle.Contribution, aliases map[string]string) Source`
 - `Dir(fsys fs.FS) Source`, `Map(files map[string]string) Source`
 - `DirRoot(dir string) (*RootSource, error)`; `*RootSource` implements `Source`
   and has `FS() fs.FS` and `Close() error`
 - `Resolve(from, spec string) (string, error)`
 - `Digest(src []byte, deps []Dep) string`
+- `Address(ctx context.Context, src Source, opts Options, p string, code []byte) (Ref, []Dep, error)`
+- `type Native struct { Members starlark.StringDict; Version string }`; `NativeDigest(spec, version string) string`
 - `type Dep struct { Spec, Digest string }` (JSON `spec`, `digest`)
 - `type Ref struct { Path, Digest string }` (JSON `path`, `digest`)
 - `NewLoader(src Source, opts Options) *Loader`;
-  `type Options struct { Predeclared starlark.StringDict; MaxSteps uint64 }`
+  `type Options struct { Predeclared starlark.StringDict; MaxSteps uint64; Native map[string]Native }`
 - `(*Loader).Bind(ctx context.Context, thread *starlark.Thread, from string)`
 - `(*Loader).Module(ctx context.Context, p string) (starlark.StringDict, Ref, error)`
 - `(*Loader).Refs(thread *starlark.Thread) []Ref`
@@ -173,8 +223,8 @@ per distinct spec a file loads.
   path: the provenance list. `Deps(thread)` returns only the direct
   dependencies as `(spec, digest)` pairs, sorted by spec: what the program's
   digest covers.
-- `Module` requires an already-canonical path; `./lib/x.star` fails with
-  `not canonical (want "lib/x.star")`.
+- `Module` requires an already-canonical path (`@alias/x.star` included);
+  `./lib/x.star` fails with `not canonical (want "lib/x.star")`.
 - A failed module is a `*modules.Error` formatted `path:line:col: message` (or
   `path: message` without a position). `Pos` is the innermost position in the
   failing module itself. `Unwrap` returns the cause, so `errors.Is(err,
