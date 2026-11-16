@@ -11,6 +11,7 @@ package examples (`*/example_test.go`), which `go test` compiles and checks.
 
 | Need | Package and contract |
 | --- | --- |
+| Compile shared event predicates, mappings and source declarations | [triggercompile](triggercompile/README.md) |
 | Parse or compile Starlark source in the shared dialect | [dialect](docs/dialect.md) |
 | Convert between Starlark values, Go values and JSON; turn built-in arguments into JSON | [values](docs/values.md) |
 | Derive JSON Schema from Go-syntax `types.go` declarations | [types](docs/types.md) |
@@ -235,3 +236,5 @@ In a Go workspace (`go.work`) that also contains consumers, run the consumers'
 tests after changing an exported API here. Run focused package tests while
 iterating and relevant broader checks for the change. This guide lists
 verification commands, not a claim that a particular checkout has passed them.
+
+`triggercompile` uses `values` and foundation-kit `trigger`; it compiles declarations and never executes targets.

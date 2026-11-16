@@ -222,3 +222,5 @@ go build ./...
 
 Package examples (`example_test.go`) carry `// Output:` checks, so `go test`
 verifies the code shown in the guides.
+
+See [shared triggers](triggercompile/README.md) for event bindings, schedules and durable admission.

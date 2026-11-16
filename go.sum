@@ -1,5 +1,7 @@
 github.com/craggy-io/foundation-kit v0.0.0-20261107163733-af7e17b71fd2 h1:G4Hyxfpn/VvYdrPhBEzR4zRjQ20ZcOR3kAKma0miToU=
 github.com/craggy-io/foundation-kit v0.0.0-20261107163733-af7e17b71fd2/go.mod h1:grT6r7EVfoxyZ6/GiQuocUvqLOCAsMSh5oOwdzwuHdg=
+github.com/craggy-io/foundation-kit v0.0.0-20261116105501-654f585a41ed h1:Bg7GD9F7nIRBV/oxmC71ce4cjJ3pMi1xHMjpA+LjKxg=
+github.com/craggy-io/foundation-kit v0.0.0-20261116105501-654f585a41ed/go.mod h1:grT6r7EVfoxyZ6/GiQuocUvqLOCAsMSh5oOwdzwuHdg=
 github.com/google/go-cmp v0.7.0 h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=
 github.com/google/go-cmp v0.7.0/go.mod h1:pXiqmnSA92OHEEa9HXL2W4E7lf9JzCmGVUdgjX3N/iU=
 github.com/google/jsonschema-go v0.4.3 h1:/DBOLZTfDow7pe2GmaJNhltueGTtDKICi8V8p+DQPd0=
