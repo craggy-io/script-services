@@ -29,6 +29,7 @@ import (
 	"go.starlark.net/syntax"
 
 	"github.com/craggy-io/script-services/dialect"
+	"github.com/craggy-io/script-services/memlimit"
 	"github.com/craggy-io/script-services/modules"
 	"github.com/craggy-io/script-services/values"
 )
@@ -41,6 +42,14 @@ type Limits struct {
 	// Timeout bounds wall-clock time on top of the caller's context. 0
 	// means only the context bounds it.
 	Timeout time.Duration
+	// MaxMemory bounds, approximately and in bytes, the Starlark values the
+	// program's thread holds at once (package memlimit): a thread over it
+	// stops with MemoryLimitMessage and MemoryExceeded set. It bounds what
+	// is kept, not what is allocated, and one operation can still allocate
+	// up to go.starlark.net's own cap before it is seen. Modules run on
+	// their own threads, bounded by modules.Options.MaxMemory. 0 means
+	// unbounded: the thread runs exactly as without it.
+	MaxMemory int64
 }
 
 // DefaultLimits are sensible limits for one script run.
@@ -126,7 +135,10 @@ type Error struct {
 	Backtrace []Frame  `json:"backtrace,omitempty"` // outermost first
 	Steps     uint64   `json:"steps"`               // execution steps used before failing
 	TimedOut  bool     `json:"timedOut,omitempty"`  // Limits.Timeout ran out
-	cause     error
+	// MemoryExceeded marks a thread stopped by Limits.MaxMemory (or a
+	// module's modules.Options.MaxMemory).
+	MemoryExceeded bool `json:"memoryExceeded,omitempty"`
+	cause          error
 }
 
 // Error formats the error as "code: file:line:col: message".
@@ -147,13 +159,16 @@ const timeLimitReason = "time limit exceeded"
 // TimeLimitMessage is Error.Message for a script stopped by Limits.Timeout.
 const TimeLimitMessage = "script exceeded its time limit"
 
-// NewThread returns a thread bounded by lim.MaxSteps whose print() goes to
-// print (nil discards it). lim.Timeout is enforced by Run, not here.
+// MemoryLimitMessage starts Error.Message for a script stopped by
+// Limits.MaxMemory; what it held and the limit follow in parentheses.
+const MemoryLimitMessage = "script exceeded its memory limit"
+
+// NewThread returns a thread bounded by lim.MaxSteps and lim.MaxMemory whose
+// print() goes to print (nil discards it). lim.Timeout is enforced by Run,
+// not here.
 func NewThread(name string, lim Limits, print func(*starlark.Thread, string)) *starlark.Thread {
 	t := &starlark.Thread{Name: name}
-	if lim.MaxSteps > 0 {
-		t.SetMaxExecutionSteps(lim.MaxSteps)
-	}
+	memlimit.Install(t, lim.MaxMemory, lim.MaxSteps)
 	if print != nil {
 		t.Print = print
 	} else {
@@ -304,6 +319,9 @@ func Failure(ctx context.Context, filename string, err error, timedOut bool, ste
 	case timedOut:
 		out.TimedOut = true
 		out.Message = TimeLimitMessage
+	case IsCancellation(err, memlimit.Reason):
+		out.MemoryExceeded = true
+		out.Message = MemoryLimitMessage + memoryDetail(err.Error())
 	}
 	return out
 }
@@ -363,7 +381,7 @@ func Exec(ctx context.Context, p Program, opts Options) (Result, error) {
 	if opts.Print != nil {
 		print = func(th *starlark.Thread, msg string) { opts.Print(PositionOf(th.CallFrame(1).Pos), msg) }
 	}
-	thread := NewThread("exec:"+filename, Limits{MaxSteps: opts.Limits.MaxSteps}, print)
+	thread := NewThread("exec:"+filename, Limits{MaxSteps: opts.Limits.MaxSteps, MaxMemory: opts.Limits.MaxMemory}, print)
 	if p.Modules != nil {
 		p.Modules.Bind(runCtx, thread, filename)
 	} else {
@@ -420,4 +438,22 @@ func Exec(ctx context.Context, p Program, opts Options) (Result, error) {
 	}
 	res.Digest = modules.Digest(p.Source, deps)
 	return res, nil
+}
+
+// memoryDetail is what follows memlimit's cancellation reason in msg: " (held
+// about …, limit …)", or "" when it isn't there.
+func memoryDetail(msg string) string {
+	marker := "Starlark computation cancelled: " + memlimit.Reason
+	i := strings.Index(msg, marker)
+	if i < 0 {
+		return ""
+	}
+	rest := msg[i+len(marker):]
+	if !strings.HasPrefix(rest, " (") {
+		return ""
+	}
+	if j := strings.Index(rest, ")"); j >= 0 {
+		return rest[:j+1]
+	}
+	return ""
 }

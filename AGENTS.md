@@ -24,8 +24,8 @@ package examples (`*/example_test.go`), which `go test` compiles and checks.
 | Read a bundle's `types.go` (`craggy.types@1`) | [types](docs/types.md) |
 | Check, run, test or print schemas of a bundle from a shell | [craggy-script](docs/cli.md) |
 
-`dialect`, `values` and `types` import nothing else from this module. `modules`
-builds on `dialect`; `script` on `dialect`, `modules` and `values`; `check` on
+`dialect`, `values`, `types` and `memlimit` import nothing else from this module. `modules`
+builds on `dialect` and `memlimit`; `script` on those, `modules` and `values`; `check` on
 `script`; `starcompile` on `check`; `startest` on `starcompile`. `schema` builds
 on `types` and `values`. `modules`, `types`, `starcompile`, `startest` and the CLI
 import foundation-kit's `bundle` and `kind`, and nothing else from it. Keep host
@@ -123,7 +123,11 @@ Loader when sources change.
 - `Exec` implements `Limits.Timeout` as a context deadline, so it also bounds
   module loads. `Limits.MaxSteps` bounds only the program's own thread. Each module
   runs on its own thread bounded by `modules.Options.MaxSteps`; its steps are not
-  counted in `Result.Steps`.
+  counted in `Result.Steps`. `Limits.MaxMemory` and `modules.Options.MaxMemory`
+  bound, in the same way, the Starlark values each thread holds (package
+  `memlimit`: what is kept, not what is allocated; one operation can still
+  allocate up to go.starlark.net's 1 GiB cap before it is seen). 0 means
+  unbounded and changes nothing.
 - Cancellation is cooperative: Starlark threads stop between steps. A host
   built-in blocked in Go is not interrupted, and time spent inside it uses no
   steps. `script` does not hand the context to built-ins; built-ins that block must
@@ -144,7 +148,10 @@ Use `errors.As` for structure and `errors.Is` for sentinels.
   caller's context ended). `TimedOut` marks `Limits.Timeout` with the message
   `script.TimeLimitMessage`. `Pos` is the innermost position in the script's own
   file; `Backtrace` is outermost first; `Steps` is what ran. The struct marshals to
-  JSON (`code`, `message`, `pos`, `backtrace`, `steps`, `timedOut`).
+  JSON (`code`, `message`, `pos`, `backtrace`, `steps`, `timedOut`,
+  `memoryExceeded`). `MemoryExceeded` marks `Limits.MaxMemory` (or a module's
+  `modules.Options.MaxMemory`), with a message starting
+  `script.MemoryLimitMessage`.
 - `script.Error.Unwrap` returns the original cause; through Starlark's
   `EvalError` that reaches the error a host built-in returned, so
   `errors.As(err, &myHostErr)` works. Return typed errors from built-ins for hosts

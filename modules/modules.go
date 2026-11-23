@@ -58,6 +58,7 @@ import (
 	"go.starlark.net/syntax"
 
 	"github.com/craggy-io/script-services/dialect"
+	"github.com/craggy-io/script-services/memlimit"
 )
 
 // Source reads module source by canonical path.
@@ -364,6 +365,10 @@ type Options struct {
 	// MaxSteps bounds the execution steps of each module's top level; 0
 	// means unbounded.
 	MaxSteps uint64
+	// MaxMemory bounds, approximately and in bytes, the Starlark values each
+	// module's top level holds at once (package memlimit; see
+	// script.Limits.MaxMemory). 0 means unbounded.
+	MaxMemory int64
 	// Native are modules implemented in Go, keyed by the exact load() spec
 	// that names them (for example "@host/http"). A native spec is matched
 	// before path resolution, from programs and modules alike. NewLoader
@@ -666,9 +671,7 @@ func (l *Loader) exec(ctx context.Context, parent *starlark.Thread, e *entry) {
 	if parent != nil && parent.Print != nil {
 		thread.Print = parent.Print
 	}
-	if l.opts.MaxSteps > 0 {
-		thread.SetMaxExecutionSteps(l.opts.MaxSteps)
-	}
+	memlimit.Install(thread, l.opts.MaxMemory, l.opts.MaxSteps)
 	l.bind(ctx, thread, e.path, e.path)
 	if err := ctx.Err(); err != nil {
 		thread.Cancel("context done: " + err.Error())

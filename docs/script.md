@@ -58,10 +58,10 @@ name to something else), the result is `null`.
 - `Exec(ctx context.Context, p Program, opts Options) (Result, error)`
 - `type Program struct { Filename string; Source []byte; Predeclared starlark.StringDict; Input any; Entry string; Modules *modules.Loader }`
 - `type Options struct { Limits Limits; Print func(pos Position, msg string) }`
-- `type Limits struct { MaxSteps uint64; Timeout time.Duration }`; `var DefaultLimits` (5,000,000 steps, 10 minutes)
+- `type Limits struct { MaxSteps uint64; Timeout time.Duration; MaxMemory int64 }`; `var DefaultLimits` (5,000,000 steps, 10 minutes)
 - `type Result struct { Value json.RawMessage; Steps uint64; Digest string; Modules []modules.Ref }`
-- `type Error struct { Code Code; Message string; Pos Position; Backtrace []Frame; Steps uint64; TimedOut bool }` with `Unwrap`
-- `type Code string`; `const Invalid, Cancelled Code`; `const TimeLimitMessage`
+- `type Error struct { Code Code; Message string; Pos Position; Backtrace []Frame; Steps uint64; TimedOut, MemoryExceeded bool }` with `Unwrap`
+- `type Code string`; `const Invalid, Cancelled Code`; `const TimeLimitMessage, MemoryLimitMessage`
 - `type Position struct { File string; Line, Col int }`; `PositionOf(syntax.Position) Position`
 - `type Frame struct { Func string; Pos Position }`
 - `NewThread(name string, lim Limits, print func(*starlark.Thread, string)) *starlark.Thread`
@@ -85,6 +85,14 @@ the `from` path for relative `load()` specs. `Result` and `Error` carry JSON tag
   in `Result.Steps`; functions defined in a module but called by the program run
   on the program's thread, so their steps count and are bounded by
   `Limits.MaxSteps`.
+- `Limits.MaxMemory` bounds, approximately and in bytes, the Starlark values
+  the program's thread holds at once; modules' threads are bounded by
+  `modules.Options.MaxMemory`. See package `memlimit`: the thread measures at
+  step checkpoints, walking what it holds only when the process has allocated
+  more than its remaining room, so other threads never stop it. It bounds what
+  is kept, not garbage, and one operation (`"x" * n`, `str.replace`) can still
+  allocate up to go.starlark.net's 1 GiB cap before it is seen. 0 means
+  unbounded, and the thread runs exactly as without it.
 - `Limits.Timeout` is applied as a context deadline on top of the caller's
   context, so it also cancels module loads. 0 means only the caller's context
   bounds the run. `TimedOut` is set only when the deadline's cancellation is
@@ -105,6 +113,7 @@ Every failure from `Exec` is a `*script.Error`:
 | syntax, undefined name, runtime error, host built-in error | `Invalid` | `Pos`, `Backtrace` from Starlark |
 | step limit | `Invalid` | message "Starlark computation cancelled: too many steps" |
 | `Limits.Timeout` | `Invalid`, `TimedOut: true` | message `TimeLimitMessage` ("script exceeded its time limit") |
+| `Limits.MaxMemory` (or a module's `modules.Options.MaxMemory`) | `Invalid`, `MemoryExceeded: true` | message `MemoryLimitMessage` ("script exceeded its memory limit") then "(held about …, limit …)" |
 | caller's context ended | `Cancelled` | |
 | input not JSON-encodable, `Predeclared["input"]` set, result not JSON-convertible | `Invalid` | no position |
 
@@ -156,7 +165,7 @@ digest of the module it loaded; `Loader.Deps` on the program's thread). See the
 
 ### Helpers for other runners
 
-`NewThread` returns a thread bounded by `lim.MaxSteps` whose `print` goes to the
+`NewThread` returns a thread bounded by `lim.MaxSteps` and `lim.MaxMemory` whose `print` goes to the
 given function (nil discards). `Run` calls `fn`, cancelling the thread when `ctx`
 ends or `lim.Timeout` elapses (reason "time limit exceeded"). `Call` combines
 them: it calls a Starlark callable on a fresh thread and classifies failures with

@@ -121,7 +121,8 @@ compiled script its digest.
 ### Execution, caching and coalescing
 
 - Each module runs at most once per Loader, in the [dialect](dialect.md), with
-  `Options.Predeclared`, on a child thread bounded by `Options.MaxSteps` (0 means
+  `Options.Predeclared`, on a child thread bounded by `Options.MaxSteps` and
+  `Options.MaxMemory` (package `memlimit`; 0 means
   unbounded) and cancelled when the load's context ends.
 - Its globals are frozen after execution and cached for the Loader's lifetime.
   Concurrent loads of one path wait for the single execution and share its result
@@ -189,7 +190,7 @@ per distinct spec a file loads.
 - `type Dep struct { Spec, Digest string }` (JSON `spec`, `digest`)
 - `type Ref struct { Path, Digest string }` (JSON `path`, `digest`)
 - `NewLoader(src Source, opts Options) *Loader`;
-  `type Options struct { Predeclared starlark.StringDict; MaxSteps uint64; Native map[string]Native }`
+  `type Options struct { Predeclared starlark.StringDict; MaxSteps uint64; MaxMemory int64; Native map[string]Native }`
 - `(*Loader).Bind(ctx context.Context, thread *starlark.Thread, from string)`
 - `(*Loader).Module(ctx context.Context, p string) (starlark.StringDict, Ref, error)`
 - `(*Loader).Refs(thread *starlark.Thread) []Ref`
