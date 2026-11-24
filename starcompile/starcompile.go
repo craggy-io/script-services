@@ -213,7 +213,7 @@ func (u *Unit) Loader(predeclared starlark.StringDict) *modules.Loader {
 	if predeclared == nil {
 		predeclared = u.opts.ModulePredeclared
 	}
-	return modules.NewLoader(u.mods, modules.Options{Predeclared: predeclared, MaxSteps: u.Limits().MaxSteps, Native: u.opts.Native})
+	return modules.NewLoader(u.mods, modules.Options{Predeclared: predeclared, MaxSteps: u.Limits().MaxSteps, MaxMemory: u.Limits().MaxMemory, Native: u.opts.Native})
 }
 
 // ExecOptions configure one Unit.Exec.
@@ -258,7 +258,7 @@ func (u *Unit) Exec(ctx context.Context, opts ExecOptions) (Execution, error) {
 		if opts.Print != nil {
 			print = func(th *starlark.Thread, msg string) { opts.Print(script.PositionOf(th.CallFrame(1).Pos), msg) }
 		}
-		thread = script.NewThread("script:"+u.c.Path, script.Limits{MaxSteps: lim.MaxSteps}, print)
+		thread = script.NewThread("script:"+u.c.Path, script.Limits{MaxSteps: lim.MaxSteps, MaxMemory: lim.MaxMemory}, print)
 	}
 	runCtx, cancel := ctx, context.CancelFunc(func() {})
 	if lim.Timeout > 0 {

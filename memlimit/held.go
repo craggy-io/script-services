@@ -242,6 +242,15 @@ func frameSlots(fr starlark.DebugFrame, fn *starlark.Function) []starlark.Value 
 	if p == nil {
 		return nil // the frame of a call not yet entered
 	}
+	// The locals slice is a three-index slice, so its Cap is trimmed to
+	// Len and cannot prove the backing allocation covers the operand
+	// stack. Guard on shape instead: locals must match the frame's own
+	// count and MaxStack must be sane, so a layout change that renames
+	// or repurposes these fields degrades to locals-only rather than
+	// sizing a slice from a nonsense count.
+	if loc.Len() != fr.NumLocals() || maxStack.Int() < 0 || maxStack.Int() > 1<<20 {
+		return locals(fr)
+	}
 	return unsafe.Slice((*starlark.Value)(p), loc.Len()+int(maxStack.Int()))
 }
 

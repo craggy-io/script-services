@@ -52,8 +52,10 @@ type Limits struct {
 	MaxMemory int64
 }
 
-// DefaultLimits are sensible limits for one script run.
-var DefaultLimits = Limits{MaxSteps: 5_000_000, Timeout: 10 * time.Minute}
+// DefaultLimits are sensible limits for one script run. MaxMemory is
+// set so the default posture is bounded; a host that runs trusted
+// scripts needing more held memory can raise it (or zero it for none).
+var DefaultLimits = Limits{MaxSteps: 5_000_000, Timeout: 10 * time.Minute, MaxMemory: 256 << 20}
 
 // Position is a source location in a script.
 type Position struct {

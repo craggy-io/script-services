@@ -219,6 +219,20 @@ func TestDomainCompilerRunsTopLevel(t *testing.T) {
 	}
 }
 
+// A memory hog run through Unit.Exec must stop at Limits.MaxMemory:
+// the limit reaches both the top-level thread and loaded modules.
+func TestExecMemoryLimitApplies(t *testing.T) {
+	opts := starcompile.Options{Limits: script.Limits{MaxSteps: 5_000_000, MaxMemory: 1 << 20}}
+	app := script1("main.star", "XS = []\nfor i in range(200):\n    XS.append('x' * 65536)\n")
+	cat, err := load(t, app, starcompile.Scripts(opts))
+	if err == nil {
+		_, err = only(t, cat).Exec(context.Background(), starcompile.ExecOptions{})
+	}
+	if err == nil || !strings.Contains(err.Error(), script.MemoryLimitMessage) {
+		t.Fatalf("Exec of memory hog = %v, want memory-limit error", err)
+	}
+}
+
 func TestExecMutableAndNative(t *testing.T) {
 	clock := modules.Native{Members: starlark.StringDict{"NOW": starlark.MakeInt(42)}, Version: "1"}
 	opts := starcompile.Options{Native: map[string]modules.Native{"@host/clock": clock}}
